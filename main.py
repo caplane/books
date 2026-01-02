@@ -280,21 +280,23 @@ async def search_serpapi_books(
             error="SERPAPI_KEY not configured"
         )]
     
-    # Build query - search for exact phrase in Google Books
+    # Build query - search for exact phrase
     search_text = quote_text[:80].strip()
+    query = f'"{search_text}"'
     if author_hint:
-        query = f'"{search_text}" {author_hint} site:books.google.com'
-    else:
-        query = f'"{search_text}" site:books.google.com'
+        query += f" {author_hint}"
     
+    # Use Google engine with tbm=bks to search Google Books tab
+    # This searches INSIDE books (like the web interface), not just the website
     params = {
         "engine": "google",
+        "tbm": "bks",  # Books tab
         "q": query,
         "api_key": SERPAPI_KEY,
     }
     
     logger.info(f"Query: {query}")
-    logger.info(f"Engine: google with site:books.google.com")
+    logger.info(f"Engine: google with tbm=bks (Google Books tab)")
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
