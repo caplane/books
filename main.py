@@ -280,19 +280,21 @@ async def search_serpapi_books(
             error="SERPAPI_KEY not configured"
         )]
     
-    # Build query - use first 80 chars
+    # Build query - search for exact phrase in Google Books
     search_text = quote_text[:80].strip()
     if author_hint:
-        search_text += f" {author_hint}"
+        query = f'"{search_text}" {author_hint} site:books.google.com'
+    else:
+        query = f'"{search_text}" site:books.google.com'
     
     params = {
-        "engine": "google_books",
-        "q": search_text,
+        "engine": "google",
+        "q": query,
         "api_key": SERPAPI_KEY,
     }
     
-    logger.info(f"Query: {search_text}")
-    logger.info(f"Engine: google_books")
+    logger.info(f"Query: {query}")
+    logger.info(f"Engine: google with site:books.google.com")
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
@@ -307,17 +309,12 @@ async def search_serpapi_books(
             # Log all keys in response
             logger.info(f"Response keys: {list(data.keys())}")
             
-            # Try different possible result keys
-            books_results = data.get("books_results", [])
+            # With tbm=bks, results come in 'organic_results'
             organic_results = data.get("organic_results", [])
-            inline_results = data.get("inline_results", [])
             
-            logger.info(f"books_results count: {len(books_results)}")
             logger.info(f"organic_results count: {len(organic_results)}")
-            logger.info(f"inline_results count: {len(inline_results)}")
             
-            # Use books_results if available, otherwise try organic_results
-            items = books_results or organic_results or inline_results
+            items = organic_results
             
             logger.info(f"Using {len(items)} results")
             
@@ -331,7 +328,8 @@ async def search_serpapi_books(
                 # Log the item structure
                 logger.debug(f"Item keys: {list(item.keys())}")
                 
-                snippet = item.get("snippet", "") or item.get("description", "")
+                # With tbm=bks, snippet is in 'snippet' field
+                snippet = item.get("snippet", "")
                 if not snippet:
                     logger.debug(f"Skipping item - no snippet")
                     continue
@@ -339,9 +337,11 @@ async def search_serpapi_books(
                 # Compute match score
                 match_score = compute_match_score(quote_text, snippet)
                 
-                # Extract page from title (often "Book Title - Page 123")
-                page_number = None
+                # Title is straightforward
                 title = item.get("title", "Unknown")
+                
+                # Extract page from title if present (often "Book Title - Page 123")
+                page_number = None
                 if " - Page " in title:
                     parts = title.rsplit(" - Page ", 1)
                     title = parts[0]
@@ -350,20 +350,25 @@ async def search_serpapi_books(
                     except (ValueError, IndexError):
                         pass
                 
-                # Parse authors
-                authors_str = item.get("authors", "") or item.get("author", "")
+                # Publication info contains authors and other metadata
+                pub_info = item.get("publication_info", {})
+                authors_str = pub_info.get("authors", "") or pub_info.get("author", "")
                 authors = [a.strip() for a in authors_str.split(",")] if authors_str else []
+                
+                # Also check for inline "book_info" 
+                book_info = item.get("book_info", {})
                 
                 logger.info(f"  Book: {title}")
                 logger.info(f"    Authors: {authors}")
                 logger.info(f"    Score: {match_score:.2f}")
+                logger.info(f"    Snippet preview: {snippet[:80]}...")
                 
                 results.append(BookMatch(
                     success=True,
                     title=title,
                     authors=authors,
-                    publisher=item.get("publisher", ""),
-                    published_date=item.get("published_date", "") or item.get("date", ""),
+                    publisher=pub_info.get("publisher", ""),
+                    published_date=pub_info.get("published_date", "") or pub_info.get("date", ""),
                     snippet=snippet,
                     page_number=page_number,
                     url=item.get("link", "") or item.get("url", ""),
