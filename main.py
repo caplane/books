@@ -9,6 +9,8 @@ REVISIONS v1.2:
 """
 
 import os
+import re
+import html
 import logging
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field, asdict
@@ -86,9 +88,23 @@ def clean_quote_text(text: str) -> str:
 def compute_match_score(user_quote: str, source_text: str) -> float:
     """Robust containment check."""
     if not user_quote or not source_text: return 0.0
-    u, s = user_quote.lower().strip(), source_text.lower().strip()
     
-    if u in s: return 1.0  # Perfect containment
+    # Strip HTML tags and decode entities from snippet
+    clean_source = re.sub(r'<[^>]+>', '', source_text)  # Remove HTML tags
+    clean_source = html.unescape(clean_source)           # Decode &amp; etc.
+    
+    # Normalize both for comparison
+    def normalize(t):
+        t = t.lower().strip()
+        t = t.replace('\u2019', "'").replace('\u2018', "'")  # Smart quotes
+        t = t.replace('\u201c', '"').replace('\u201d', '"')
+        t = t.replace('\u2014', '-').replace('\u2013', '-')  # Dashes
+        return t
+    
+    u, s = normalize(user_quote), normalize(clean_source)
+    
+    if u in s: return 1.0  # Quote contained in snippet
+    if s in u: return 1.0  # Snippet contained in quote
     
     # Check if first 50% of quote is in snippet
     cutoff = int(len(u) * 0.5)
