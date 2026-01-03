@@ -107,19 +107,45 @@ def compute_match_score(user_quote: str, source_text: str) -> float:
 
 
 def clean_quote_text(text: str) -> str:
-    """Clean special characters that break Google Books API search."""
-    # Replace curly quotes with straight quotes
-    text = text.replace('"', '"').replace('"', '"')
-    text = text.replace(''', "'").replace(''', "'")
+    """
+    Clean special characters that break Google Books API search.
     
-    # Replace em-dash and en-dash with regular dash
-    text = text.replace('—', '-').replace('–', '-')
+    Two distinct cases:
+    - Semantic boundary quotes (start/end): STRIP - they mark "this is a quotation"
+    - Internal apostrophes (Tess's, don't): PRESERVE - part of the searchable string
+    """
+    # Step 1: Strip semantic boundary quotes (start/end of string only)
+    text = text.strip().strip('"').strip('\u201C').strip('\u201D').strip()
     
-    # Remove any other non-ASCII that might cause issues
+    # Step 2: Replace curly double quotes with straight (will be removed later)
+    text = text.replace('\u201C', '"').replace('\u201D', '"')
+    
+    # Step 3: Replace ALL apostrophe-like characters with straight apostrophe
+    # Must do this BEFORE ASCII encoding so they survive
+    text = text.replace('\u2019', "'")   # U+2019 RIGHT SINGLE QUOTATION MARK
+    text = text.replace('\u2018', "'")   # U+2018 LEFT SINGLE QUOTATION MARK
+    text = text.replace('\u02BC', "'")   # U+02BC MODIFIER LETTER APOSTROPHE
+    text = text.replace('\u02BB', "'")   # U+02BB MODIFIER LETTER TURNED COMMA
+    text = text.replace('\u00B4', "'")   # U+00B4 ACUTE ACCENT
+    text = text.replace('`', "'")        # U+0060 GRAVE ACCENT
+    text = text.replace('\u2032', "'")   # U+2032 PRIME
+    
+    # Step 4: Replace em-dash and en-dash with regular dash/hyphen
+    text = text.replace('\u2014', '-').replace('\u2013', '-')
+    
+    # Step 5: Replace non-breaking and special whitespace with regular space
+    text = text.replace('\u00A0', ' ')   # Non-breaking space
+    text = text.replace('\u2009', ' ')   # Thin space
+    text = text.replace('\u2002', ' ')   # En space
+    text = text.replace('\u2003', ' ')   # Em space
+    text = text.replace('\u200B', '')    # Zero-width space (remove)
+    
+    # Step 6: Remove other non-ASCII that might cause issues
     text = text.encode('ascii', 'ignore').decode('ascii')
     
-    # Strip leading/trailing quotes (we'll add our own for exact phrase)
-    text = text.strip().strip('"').strip("'")
+    # Step 7: Remove internal double quote characters
+    # (they would break phrase search wrapping)
+    text = text.replace('"', '')
     
     return text.strip()
 
