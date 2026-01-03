@@ -105,6 +105,24 @@ def compute_match_score(user_quote: str, source_text: str) -> float:
     source_clean = source_text.lower().strip()
     return SequenceMatcher(None, user_clean, source_clean).ratio()
 
+
+def clean_quote_text(text: str) -> str:
+    """Clean special characters that break Google Books API search."""
+    # Replace curly quotes with straight quotes
+    text = text.replace('"', '"').replace('"', '"')
+    text = text.replace(''', "'").replace(''', "'")
+    
+    # Replace em-dash and en-dash with regular dash
+    text = text.replace('—', '-').replace('–', '-')
+    
+    # Remove any other non-ASCII that might cause issues
+    text = text.encode('ascii', 'ignore').decode('ascii')
+    
+    # Strip leading/trailing quotes (we'll add our own for exact phrase)
+    text = text.strip().strip('"').strip("'")
+    
+    return text.strip()
+
 # =============================================================================
 # NATIVE GOOGLE BOOKS API
 # =============================================================================
@@ -135,8 +153,10 @@ async def search_google_books_api(
             error="GOOGLE_BOOKS_API_KEY not configured"
         )]
     
-    # Build query
-    search_text = quote_text[:60].strip()
+    # Build query - CLEAN THE QUOTE FIRST
+    clean_text = clean_quote_text(quote_text)
+    search_text = clean_text[:60].strip()
+    
     if use_exact_phrase:
         query = f'"{search_text}"'
     else:
@@ -144,6 +164,10 @@ async def search_google_books_api(
     
     if author_hint:
         query += f" inauthor:{author_hint}"
+    
+    logger.info(f"Original: '{quote_text[:60]}...'")
+    logger.info(f"Cleaned:  '{search_text}'")
+    logger.info(f"Query:    {query}")
     
     params = {
         "q": query,
@@ -286,17 +310,16 @@ async def search_serpapi_books(
     if author_hint:
         query += f" {author_hint}"
     
-    # Use Google engine with tbm=bks to search Google Books tab
-    # This searches INSIDE books (like the web interface), not just the website
+    # Use plain Google search - it naturally returns Google Books results
+    # for literary quotes. tbm=bks is NOT supported by SerpAPI.
     params = {
         "engine": "google",
-        "tbm": "bks",  # Books tab
         "q": query,
         "api_key": SERPAPI_KEY,
     }
     
     logger.info(f"Query: {query}")
-    logger.info(f"Engine: google with tbm=bks (Google Books tab)")
+    logger.info(f"Engine: google (plain search)")
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
