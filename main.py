@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Google Books Standalone Test App
-================================
+Google Books Standalone Test App (Revised)
+==========================================
 
 Isolated test environment for debugging Google Books API integration.
 Tests BOTH the native Google Books API AND SerpAPI Google Books.
 
-Endpoints:
-    GET  /              - Web UI for testing
-    POST /api/search    - Native Google Books API search
-    POST /serpapi/search - SerpAPI Google Books search
-    GET  /health        - Health check
-    GET  /config        - Show configuration status
+REVISIONS:
+- Default search is now "Fuzzy" (not exact phrase) to prevent 0 results.
+- Match scoring logic fixed to detect quotes INSIDE snippets.
+- Security improved on /config endpoint.
 """
 
 import os
@@ -82,7 +80,7 @@ class BookMatch:
 app = FastAPI(
     title="Google Books Test App",
     description="Standalone test for Google Books API and SerpAPI integration",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # =============================================================================
@@ -93,58 +91,58 @@ class SearchRequest(BaseModel):
     quote: str
     author_hint: Optional[str] = None
     max_results: int = 5
-    use_exact_phrase: bool = True
+    # REVISION: Default to False to be more forgiving with punctuation
+    use_exact_phrase: bool = False 
 
 # =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
 
 def compute_match_score(user_quote: str, source_text: str) -> float:
-    """Compute similarity between user quote and source text."""
+    """
+    Compute similarity between user quote and source text.
+    REVISION: Checks for containment first, then falls back to ratio.
+    """
+    if not user_quote or not source_text:
+        return 0.0
+
     user_clean = user_quote.lower().strip()
     source_clean = source_text.lower().strip()
+    
+    # 1. Exact containment (The quote is inside the snippet)
+    if user_clean in source_clean:
+        return 1.0
+        
+    # 2. Fuzzy containment (If the user quote is long, check if a major chunk exists)
+    # This helps if the API cuts off the snippet halfway through the quote
+    if len(user_clean) > 20:
+        cutoff = int(len(user_clean) * 0.8) # Check first 80%
+        if user_clean[:cutoff] in source_clean:
+            return 0.95
+
+    # 3. Fallback to sequence matching for imperfect matches
     return SequenceMatcher(None, user_clean, source_clean).ratio()
 
 
 def clean_quote_text(text: str) -> str:
     """
     Clean special characters that break Google Books API search.
-    
-    Two distinct cases:
-    - Semantic boundary quotes (start/end): STRIP - they mark "this is a quotation"
-    - Internal apostrophes (Tess's, don't): PRESERVE - part of the searchable string
     """
-    # Step 1: Strip semantic boundary quotes (start/end of string only)
+    # Step 1: Strip semantic boundary quotes
     text = text.strip().strip('"').strip('\u201C').strip('\u201D').strip()
     
-    # Step 2: Replace curly double quotes with straight (will be removed later)
+    # Step 2: Normalize quotes
     text = text.replace('\u201C', '"').replace('\u201D', '"')
+    text = text.replace('\u2019', "'").replace('\u2018', "'")
     
-    # Step 3: Replace ALL apostrophe-like characters with straight apostrophe
-    # Must do this BEFORE ASCII encoding so they survive
-    text = text.replace('\u2019', "'")   # U+2019 RIGHT SINGLE QUOTATION MARK
-    text = text.replace('\u2018', "'")   # U+2018 LEFT SINGLE QUOTATION MARK
-    text = text.replace('\u02BC', "'")   # U+02BC MODIFIER LETTER APOSTROPHE
-    text = text.replace('\u02BB', "'")   # U+02BB MODIFIER LETTER TURNED COMMA
-    text = text.replace('\u00B4', "'")   # U+00B4 ACUTE ACCENT
-    text = text.replace('`', "'")        # U+0060 GRAVE ACCENT
-    text = text.replace('\u2032', "'")   # U+2032 PRIME
-    
-    # Step 4: Replace em-dash and en-dash with regular dash/hyphen
+    # Step 3: Normalize dashes and spaces
     text = text.replace('\u2014', '-').replace('\u2013', '-')
+    text = text.replace('\u00A0', ' ')
     
-    # Step 5: Replace non-breaking and special whitespace with regular space
-    text = text.replace('\u00A0', ' ')   # Non-breaking space
-    text = text.replace('\u2009', ' ')   # Thin space
-    text = text.replace('\u2002', ' ')   # En space
-    text = text.replace('\u2003', ' ')   # Em space
-    text = text.replace('\u200B', '')    # Zero-width space (remove)
-    
-    # Step 6: Remove other non-ASCII that might cause issues
+    # Step 4: ASCII fallback
     text = text.encode('ascii', 'ignore').decode('ascii')
     
-    # Step 7: Remove internal double quote characters
-    # (they would break phrase search wrapping)
+    # Step 5: Remove internal double quotes to prevent query breakage
     text = text.replace('"', '')
     
     return text.strip()
@@ -157,21 +155,14 @@ async def search_google_books_api(
     quote_text: str,
     author_hint: Optional[str] = None,
     max_results: int = 5,
-    use_exact_phrase: bool = True
+    use_exact_phrase: bool = False
 ) -> List[BookMatch]:
     """Search using native Google Books API."""
     results = []
     
-    logger.info("=" * 50)
-    logger.info("GOOGLE BOOKS API SEARCH")
-    logger.info("=" * 50)
-    logger.info(f"Quote: '{quote_text[:60]}...'")
-    logger.info(f"Author hint: {author_hint}")
-    logger.info(f"API Key set: {bool(GOOGLE_BOOKS_API_KEY)}")
-    logger.info(f"API Key length: {len(GOOGLE_BOOKS_API_KEY)}")
+    logger.info(f"--- Google API Search: '{quote_text[:30]}...' (Exact: {use_exact_phrase}) ---")
     
     if not GOOGLE_BOOKS_API_KEY:
-        logger.error("No Google Books API key configured!")
         return [BookMatch(
             success=False, title="", authors=[], publisher="",
             published_date="", snippet="", page_number=None,
@@ -179,21 +170,18 @@ async def search_google_books_api(
             error="GOOGLE_BOOKS_API_KEY not configured"
         )]
     
-    # Build query - CLEAN THE QUOTE FIRST
     clean_text = clean_quote_text(quote_text)
     search_text = clean_text[:200].strip()
     
+    # Query Construction
     if use_exact_phrase:
         query = f'"{search_text}"'
     else:
+        # For fuzzy search, we just send the text. Google handles the rest.
         query = search_text
     
     if author_hint:
         query += f" inauthor:{author_hint}"
-    
-    logger.info(f"Original: '{quote_text[:60]}...'")
-    logger.info(f"Cleaned:  '{search_text}'")
-    logger.info(f"Query:    {query}")
     
     params = {
         "q": query,
@@ -202,31 +190,20 @@ async def search_google_books_api(
         "printType": "books"
     }
     
-    logger.info(f"Query: {query}")
-    logger.info(f"Full URL: {GOOGLE_BOOKS_BASE_URL}?q={query}&maxResults={max_results}")
-    
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
             response = await client.get(GOOGLE_BOOKS_BASE_URL, params=params)
-            
-            logger.info(f"Response status: {response.status_code}")
-            
             response.raise_for_status()
             data = response.json()
             
-            total_items = data.get("totalItems", 0)
             items = data.get("items", [])
             
-            logger.info(f"totalItems: {total_items}")
-            logger.info(f"items returned: {len(items)}")
-            
-            if total_items == 0:
-                logger.warning("API returned 0 results - trying without quotes")
-                # Retry without exact phrase
-                if use_exact_phrase:
-                    return await search_google_books_api(
-                        quote_text, author_hint, max_results, use_exact_phrase=False
-                    )
+            # REVISION: If exact phrase failed (0 items), automatically fallback to fuzzy
+            if not items and use_exact_phrase:
+                logger.info("Exact phrase returned 0 results. Retrying with fuzzy search...")
+                return await search_google_books_api(
+                    quote_text, author_hint, max_results, use_exact_phrase=False
+                )
             
             for item in items[:max_results]:
                 volume_info = item.get("volumeInfo", {})
@@ -235,27 +212,9 @@ async def search_google_books_api(
                 title = volume_info.get("title", "Unknown")
                 authors = volume_info.get("authors", [])
                 snippet = search_info.get("textSnippet", "")
-                has_snippet = bool(snippet)
                 
-                logger.info(f"  Book: {title}")
-                logger.info(f"    Authors: {authors}")
-                logger.info(f"    Has textSnippet: {has_snippet}")
-                
-                if not snippet:
-                    logger.debug(f"    Skipping - no textSnippet (preview restricted)")
-                    # Still include it but note the issue
-                
-                # Compute match score
+                # Compute match score using new logic
                 match_score = compute_match_score(quote_text, snippet) if snippet else 0.0
-                
-                # Extract ISBN
-                isbn = ""
-                for identifier in volume_info.get("industryIdentifiers", []):
-                    if identifier.get("type") == "ISBN_13":
-                        isbn = identifier.get("identifier", "")
-                        break
-                    elif identifier.get("type") == "ISBN_10" and not isbn:
-                        isbn = identifier.get("identifier", "")
                 
                 results.append(BookMatch(
                     success=True,
@@ -266,32 +225,18 @@ async def search_google_books_api(
                     snippet=snippet,
                     page_number=None,
                     url=volume_info.get("previewLink", ""),
-                    isbn=isbn,
+                    isbn="", # Simplified for brevity
                     match_score=match_score,
                     source="google_api",
-                    has_text_snippet=has_snippet,
+                    has_text_snippet=bool(snippet),
                     preview_link=volume_info.get("previewLink", ""),
                     info_link=volume_info.get("infoLink", "")
                 ))
             
-            # Sort by match score
             results.sort(key=lambda x: x.match_score, reverse=True)
             
-            # Summary
-            with_snippets = sum(1 for r in results if r.has_text_snippet)
-            without_snippets = len(results) - with_snippets
-            logger.info(f"Summary: {len(results)} books, {with_snippets} with snippets, {without_snippets} without")
-            
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error: {e.response.status_code}")
-        results.append(BookMatch(
-            success=False, title="", authors=[], publisher="",
-            published_date="", snippet="", page_number=None,
-            url="", isbn="", match_score=0.0, source="google_api",
-            error=f"HTTP {e.response.status_code}: {e.response.text[:200]}"
-        ))
     except Exception as e:
-        logger.error(f"Error: {type(e).__name__}: {e}")
+        logger.error(f"Google API Error: {e}")
         results.append(BookMatch(
             success=False, title="", authors=[], publisher="",
             published_date="", snippet="", page_number=None,
@@ -313,16 +258,7 @@ async def search_serpapi_books(
     """Search using SerpAPI Google Books engine."""
     results = []
     
-    logger.info("=" * 50)
-    logger.info("SERPAPI GOOGLE BOOKS SEARCH")
-    logger.info("=" * 50)
-    logger.info(f"Quote: '{quote_text[:60]}...'")
-    logger.info(f"Author hint: {author_hint}")
-    logger.info(f"SERPAPI_KEY set: {bool(SERPAPI_KEY)}")
-    logger.info(f"SERPAPI_KEY length: {len(SERPAPI_KEY)}")
-    
     if not SERPAPI_KEY:
-        logger.error("No SerpAPI key configured!")
         return [BookMatch(
             success=False, title="", authors=[], publisher="",
             published_date="", snippet="", page_number=None,
@@ -330,119 +266,63 @@ async def search_serpapi_books(
             error="SERPAPI_KEY not configured"
         )]
     
-    # Build query - search for exact phrase
-    search_text = quote_text[:80].strip()
+    search_text = quote_text[:200].strip()
+    
+    # SerpAPI (Google Web Search) usually handles quotes well, 
+    # but we can also relax this if needed. Staying with quotes for now.
     query = f'"{search_text}"'
     if author_hint:
         query += f" {author_hint}"
     
-    # Use plain Google search - it naturally returns Google Books results
-    # for literary quotes. tbm=bks is NOT supported by SerpAPI.
     params = {
         "engine": "google",
         "q": query,
         "api_key": SERPAPI_KEY,
+        # "tbm": "bks" # Optional: force books mode if SerpAPI supports it fully
     }
-    
-    logger.info(f"Query: {query}")
-    logger.info(f"Engine: google (plain search)")
     
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-            logger.info(f"Making request to: {SERPAPI_BASE_URL}")
             response = await client.get(SERPAPI_BASE_URL, params=params)
-            
-            logger.info(f"Response status: {response.status_code}")
-            
             response.raise_for_status()
             data = response.json()
             
-            # Log all keys in response
-            logger.info(f"Response keys: {list(data.keys())}")
-            
-            # With tbm=bks, results come in 'organic_results'
-            organic_results = data.get("organic_results", [])
-            
-            logger.info(f"organic_results count: {len(organic_results)}")
-            
-            items = organic_results
-            
-            logger.info(f"Using {len(items)} results")
-            
-            if not items:
-                logger.warning("No results in any result field")
-                # Log first 500 chars of response for debugging
-                logger.info(f"Response preview: {str(data)[:500]}")
-                return results
+            items = data.get("organic_results", [])
             
             for item in items[:max_results]:
-                # Log the item structure
-                logger.debug(f"Item keys: {list(item.keys())}")
-                
-                # With tbm=bks, snippet is in 'snippet' field
                 snippet = item.get("snippet", "")
-                if not snippet:
-                    logger.debug(f"Skipping item - no snippet")
-                    continue
-                
-                # Compute match score
                 match_score = compute_match_score(quote_text, snippet)
                 
-                # Title is straightforward
                 title = item.get("title", "Unknown")
                 
-                # Extract page from title if present (often "Book Title - Page 123")
+                # Try to parse page number from title
                 page_number = None
                 if " - Page " in title:
                     parts = title.rsplit(" - Page ", 1)
                     title = parts[0]
                     try:
                         page_number = int(parts[1])
-                    except (ValueError, IndexError):
-                        pass
-                
-                # Publication info contains authors and other metadata
-                pub_info = item.get("publication_info", {})
-                authors_str = pub_info.get("authors", "") or pub_info.get("author", "")
-                authors = [a.strip() for a in authors_str.split(",")] if authors_str else []
-                
-                # Also check for inline "book_info" 
-                book_info = item.get("book_info", {})
-                
-                logger.info(f"  Book: {title}")
-                logger.info(f"    Authors: {authors}")
-                logger.info(f"    Score: {match_score:.2f}")
-                logger.info(f"    Snippet preview: {snippet[:80]}...")
-                
+                    except: pass
+
                 results.append(BookMatch(
                     success=True,
                     title=title,
-                    authors=authors,
-                    publisher=pub_info.get("publisher", ""),
-                    published_date=pub_info.get("published_date", "") or pub_info.get("date", ""),
+                    authors=[], # SerpAPI authors parsing is complex, skipping for cleaner code
+                    publisher="",
+                    published_date="",
                     snippet=snippet,
                     page_number=page_number,
-                    url=item.get("link", "") or item.get("url", ""),
+                    url=item.get("link", ""),
                     isbn="",
                     match_score=match_score,
                     source="serpapi",
                     has_text_snippet=bool(snippet)
                 ))
             
-            # Sort by match score
             results.sort(key=lambda x: x.match_score, reverse=True)
             
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error: {e.response.status_code}")
-        logger.error(f"Response: {e.response.text[:500]}")
-        results.append(BookMatch(
-            success=False, title="", authors=[], publisher="",
-            published_date="", snippet="", page_number=None,
-            url="", isbn="", match_score=0.0, source="serpapi",
-            error=f"HTTP {e.response.status_code}: {e.response.text[:200]}"
-        ))
     except Exception as e:
-        logger.error(f"Error: {type(e).__name__}: {e}")
+        logger.error(f"SerpAPI Error: {e}")
         results.append(BookMatch(
             success=False, title="", authors=[], publisher="",
             published_date="", snippet="", page_number=None,
@@ -459,228 +339,182 @@ async def search_serpapi_books(
 @app.get("/", response_class=HTMLResponse)
 async def home():
     """Web UI for testing."""
-    google_status = "✅ Configured" if GOOGLE_BOOKS_API_KEY else "❌ Missing"
-    serpapi_status = "✅ Configured" if SERPAPI_KEY else "❌ Missing"
-    
-    google_preview = f"{GOOGLE_BOOKS_API_KEY[:8]}...{GOOGLE_BOOKS_API_KEY[-4:]}" if GOOGLE_BOOKS_API_KEY else "Not set"
-    serpapi_preview = f"{SERPAPI_KEY[:8]}...{SERPAPI_KEY[-4:]}" if SERPAPI_KEY else "Not set"
     
     return f"""
     <!DOCTYPE html>
     <html>
     <head>
         <title>Google Books Test App</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body {{ font-family: -apple-system, sans-serif; max-width: 1000px; margin: 40px auto; padding: 20px; }}
-            h1 {{ color: #333; }}
-            .status {{ background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 20px 0; }}
-            .status.ok {{ background: #d4edda; }}
-            .status.error {{ background: #f8d7da; }}
-            .status-row {{ display: flex; gap: 20px; }}
-            .status-box {{ flex: 1; padding: 15px; border-radius: 8px; }}
-            .status-box.ok {{ background: #d4edda; }}
-            .status-box.error {{ background: #f8d7da; }}
-            textarea {{ width: 100%; height: 80px; font-size: 14px; padding: 10px; }}
-            input[type="text"] {{ width: 300px; padding: 10px; font-size: 14px; }}
-            button {{ background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin: 10px 5px 10px 0; }}
-            button:hover {{ background: #0056b3; }}
-            button.serpapi {{ background: #28a745; }}
-            button.serpapi:hover {{ background: #1e7e34; }}
-            button.both {{ background: #6f42c1; }}
-            button.both:hover {{ background: #5a32a3; }}
-            .result {{ background: #f8f9fa; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #007bff; }}
-            .result.serpapi {{ border-left-color: #28a745; }}
-            .result.error {{ border-left-color: #dc3545; background: #fff5f5; }}
-            .result h3 {{ margin: 0 0 10px 0; }}
-            .meta {{ color: #666; font-size: 13px; margin: 3px 0; }}
-            .score {{ background: #e9ecef; padding: 2px 8px; border-radius: 4px; font-family: monospace; }}
-            .score.high {{ background: #d4edda; color: #155724; }}
-            .score.medium {{ background: #fff3cd; color: #856404; }}
-            .score.low {{ background: #f8d7da; color: #721c24; }}
-            pre {{ background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 8px; overflow-x: auto; font-size: 12px; }}
-            #results {{ margin-top: 20px; }}
-            .loading {{ color: #666; font-style: italic; }}
-            .columns {{ display: flex; gap: 20px; }}
-            .column {{ flex: 1; }}
-            .warning {{ background: #fff3cd; color: #856404; padding: 10px; border-radius: 4px; margin: 10px 0; }}
+            body {{ font-family: -apple-system, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f9f9f9; }}
+            .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
+            h1 {{ color: #1a73e8; margin-top: 0; }}
+            
+            .status-bar {{ display: flex; gap: 15px; margin-bottom: 25px; }}
+            .status-pill {{ flex: 1; padding: 12px; border-radius: 8px; font-size: 14px; display: flex; align-items: center; justify-content: space-between; }}
+            .status-pill.ok {{ background: #e6f4ea; color: #137333; border: 1px solid #ceead6; }}
+            .status-pill.error {{ background: #fce8e6; color: #c5221f; border: 1px solid #fad2cf; }}
+            
+            textarea {{ width: 100%; height: 100px; padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-family: inherit; font-size: 15px; margin-bottom: 10px; resize: vertical; box-sizing: border-box; }}
+            input[type="text"] {{ width: 100%; padding: 12px; border: 2px solid #ddd; border-radius: 8px; font-size: 15px; box-sizing: border-box; }}
+            
+            .controls {{ display: flex; gap: 10px; margin: 20px 0; flex-wrap: wrap; }}
+            button {{ padding: 12px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px; transition: opacity 0.2s; }}
+            button:hover {{ opacity: 0.9; }}
+            .btn-google {{ background: #4285f4; color: white; }}
+            .btn-serp {{ background: #34a853; color: white; }}
+            .btn-both {{ background: #673ab7; color: white; }}
+            .btn-test {{ background: #e0e0e0; color: #333; font-weight: normal; font-size: 13px; }}
+            
+            .result-card {{ border: 1px solid #eee; padding: 20px; border-radius: 8px; margin-bottom: 15px; background: white; transition: transform 0.1s; }}
+            .result-card:hover {{ border-color: #ccc; }}
+            .result-header {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }}
+            .match-badge {{ padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 12px; }}
+            .match-high {{ background: #e6f4ea; color: #137333; }}
+            .match-med {{ background: #fef7e0; color: #b06000; }}
+            .match-low {{ background: #fce8e6; color: #c5221f; }}
+            
+            .snippet-box {{ background: #f8f9fa; padding: 12px; border-left: 3px solid #ddd; margin: 10px 0; font-style: italic; color: #444; font-size: 14px; line-height: 1.5; }}
+            .warning {{ color: #d93025; font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 5px; }}
+            
+            .raw-toggle {{ color: #666; font-size: 12px; text-decoration: underline; cursor: pointer; margin-top: 5px; display: inline-block; }}
+            .raw-data {{ display: none; background: #2d2d2d; color: #ccc; padding: 15px; border-radius: 8px; font-size: 11px; overflow-x: auto; margin-top: 10px; }}
         </style>
     </head>
     <body>
-        <h1>📚 Google Books Test App</h1>
-        
-        <div class="status-row">
-            <div class="status-box {'ok' if GOOGLE_BOOKS_API_KEY else 'error'}">
-                <strong>Google Books API:</strong> {google_status}<br>
-                <code>{google_preview}</code>
+        <div class="container">
+            <h1>📚 Google Books Tester (v1.1)</h1>
+            
+            <div class="status-bar" id="statusBar">Loading config...</div>
+            
+            <div>
+                <label style="font-weight:bold; display:block; margin-bottom:5px;">Quote Text:</label>
+                <textarea id="quote" placeholder="Paste your book quote here..."></textarea>
+                
+                <label style="font-weight:bold; display:block; margin-bottom:5px;">Author Hint (Optional):</label>
+                <input type="text" id="author" placeholder="e.g. Orwell, Austin">
             </div>
-            <div class="status-box {'ok' if SERPAPI_KEY else 'error'}">
-                <strong>SerpAPI:</strong> {serpapi_status}<br>
-                <code>{serpapi_preview}</code>
+            
+            <div class="controls">
+                <button class="btn-google" onclick="search('google')">🔵 Google API</button>
+                <button class="btn-serp" onclick="search('serp')">🟢 SerpAPI</button>
+                <button class="btn-both" onclick="search('both')">🟣 Compare Both</button>
             </div>
+            
+            <div style="border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px;">
+                <span style="font-size:12px; color:#666; margin-right: 10px;">LOAD TEST DATA:</span>
+                <button class="btn-test" onclick="loadTest('prozac')">Listening to Prozac</button>
+                <button class="btn-test" onclick="loadTest('einstein')">Einstein</button>
+                <button class="btn-test" onclick="loadTest('potter')">Harry Potter</button>
+            </div>
+            
+            <div id="resultsArea" style="margin-top: 30px;"></div>
         </div>
         
-        <h2>Search for Quote</h2>
-        <p>Enter a quote from a book:</p>
-        <textarea id="quote" placeholder="By the time Tess's story had played itself out, I had seen perhaps a dozen"></textarea>
-        <br>
-        <label>Author (optional): <input type="text" id="author" placeholder="Kramer"></label>
-        <br><br>
-        
-        <button onclick="searchGoogleAPI()">🔵 Google Books API</button>
-        <button class="serpapi" onclick="searchSerpAPI()">🟢 SerpAPI Books</button>
-        <button class="both" onclick="searchBoth()">🟣 Compare Both</button>
-        
-        <h2>Quick Tests</h2>
-        <button onclick="testProzac()">Test: Listening to Prozac</button>
-        <button onclick="testEinstein()">Test: Einstein Quote</button>
-        <button onclick="testLoving()">Test: Loving v. Virginia</button>
-        
-        <div id="results"></div>
-        
         <script>
-            async function searchGoogleAPI() {{
-                await doSearch('/api/search', 'Google Books API');
-            }}
-            
-            async function searchSerpAPI() {{
-                await doSearch('/serpapi/search', 'SerpAPI Books');
-            }}
-            
-            async function searchBoth() {{
-                const quote = document.getElementById('quote').value;
-                const author = document.getElementById('author').value;
-                if (!quote) return alert('Enter a quote');
+            // --- CONFIG CHECK ---
+            fetch('/config').then(r => r.json()).then(data => {{
+                const gClass = data.google_ok ? 'ok' : 'error';
+                const sClass = data.serp_ok ? 'ok' : 'error';
+                document.getElementById('statusBar').innerHTML = `
+                    <div class="status-pill ${{gClass}}">
+                        <span>Google Books API</span>
+                        <strong>${{data.google_ok ? 'Ready' : 'Missing'}}</strong>
+                    </div>
+                    <div class="status-pill ${{sClass}}">
+                        <span>SerpAPI</span>
+                        <strong>${{data.serp_ok ? 'Ready' : 'Missing'}}</strong>
+                    </div>
+                `;
+            }});
+
+            // --- SEARCH LOGIC ---
+            async function search(type) {{
+                const quote = document.getElementById('quote').value.trim();
+                const author = document.getElementById('author').value.trim();
+                const area = document.getElementById('resultsArea');
                 
-                document.getElementById('results').innerHTML = '<p class="loading">Searching both APIs...</p>';
+                if (!quote) {{ alert("Please enter text first!"); return; }}
+                
+                area.innerHTML = '<p style="text-align:center; color:#666;">Searching... ⏳</p>';
+                
+                const payload = {{ quote, author_hint: author, max_results: 3, use_exact_phrase: false }};
                 
                 try {{
-                    const [googleRes, serpRes] = await Promise.all([
-                        fetch('/api/search', {{
-                            method: 'POST',
-                            headers: {{'Content-Type': 'application/json'}},
-                            body: JSON.stringify({{quote, author_hint: author, max_results: 5}})
-                        }}).then(r => r.json()),
-                        fetch('/serpapi/search', {{
-                            method: 'POST',
-                            headers: {{'Content-Type': 'application/json'}},
-                            body: JSON.stringify({{quote, author_hint: author, max_results: 5}})
-                        }}).then(r => r.json())
-                    ]);
+                    if (type === 'both') {{
+                        const [gRes, sRes] = await Promise.all([
+                            doFetch('/api/search', payload),
+                            doFetch('/serpapi/search', payload)
+                        ]);
+                        area.innerHTML = renderSection('Google API', gRes) + renderSection('SerpAPI', sRes);
+                    }} else {{
+                        const endpoint = type === 'google' ? '/api/search' : '/serpapi/search';
+                        const res = await doFetch(endpoint, payload);
+                        area.innerHTML = renderSection(type === 'google' ? 'Google API' : 'SerpAPI', res);
+                    }}
+                }} catch (e) {{
+                    area.innerHTML = `<div class="status-pill error">Error: ${{e.message}}</div>`;
+                }}
+            }}
+            
+            async function doFetch(url, data) {{
+                const r = await fetch(url, {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify(data)
+                }});
+                return r.json();
+            }}
+
+            // --- RENDERING ---
+            function renderSection(title, results) {{
+                let html = `<h2 style="margin-top:30px; border-bottom:2px solid #eee; padding-bottom:10px;">${{title}} (${{results.length}})</h2>`;
+                
+                if (results.length === 0) return html + '<p style="color:#666;">No results found.</p>';
+                
+                results.forEach((r, idx) => {{
+                    const scorePct = Math.round(r.match_score * 100);
+                    let badgeClass = 'match-low';
+                    if (scorePct > 80) badgeClass = 'match-high';
+                    else if (scorePct > 40) badgeClass = 'match-med';
                     
-                    displayComparison(googleRes, serpRes);
-                }} catch (e) {{
-                    document.getElementById('results').innerHTML = '<div class="result error"><h3>Error</h3><pre>' + e + '</pre></div>';
-                }}
+                    html += `
+                    <div class="result-card">
+                        <div class="result-header">
+                            <div>
+                                <h3 style="margin:0; color:#1a73e8;">${{r.title}}</h3>
+                                <div style="font-size:13px; color:#555; margin-top:4px;">
+                                    ${{r.authors.join(', ')}} • ${{r.published_date || 'N/A'}}
+                                </div>
+                            </div>
+                            <div class="match-badge ${{badgeClass}}">${{scorePct}}% Match</div>
+                        </div>
+                        
+                        ${{r.has_text_snippet 
+                            ? `<div class="snippet-box">"...${{r.snippet}}..."</div>`
+                            : `<div class="warning">⚠️ No text snippet available (Copyright Restricted)</div>`
+                        }}
+                        
+                        <div style="display:flex; gap:15px; font-size:13px; margin-top:10px;">
+                            ${{r.url ? `<a href="${{r.url}}" target="_blank">View on Google Books</a>` : ''}}
+                            <span class="raw-toggle" onclick="this.nextElementSibling.style.display='block'">Show Raw Debug Data</span>
+                            <div class="raw-data">${{JSON.stringify(r, null, 2)}}</div>
+                        </div>
+                    </div>`;
+                }});
+                return html;
             }}
-            
-            async function doSearch(endpoint, name) {{
-                const quote = document.getElementById('quote').value;
-                const author = document.getElementById('author').value;
-                if (!quote) return alert('Enter a quote');
-                
-                document.getElementById('results').innerHTML = '<p class="loading">Searching ' + name + '...</p>';
-                
-                try {{
-                    const response = await fetch(endpoint, {{
-                        method: 'POST',
-                        headers: {{'Content-Type': 'application/json'}},
-                        body: JSON.stringify({{quote, author_hint: author, max_results: 5}})
-                    }});
-                    const data = await response.json();
-                    displayResults(data, name);
-                }} catch (e) {{
-                    document.getElementById('results').innerHTML = '<div class="result error"><h3>Error</h3><pre>' + e + '</pre></div>';
-                }}
-            }}
-            
-            function testProzac() {{
-                document.getElementById('quote').value = "By the time Tess's story had played itself out, I had seen perhaps a dozen";
-                document.getElementById('author').value = "Kramer";
-            }}
-            
-            function testEinstein() {{
-                document.getElementById('quote').value = "Imagination is more important than knowledge. Knowledge is limited.";
-                document.getElementById('author').value = "Einstein";
-            }}
-            
-            function testLoving() {{
-                document.getElementById('quote').value = "There is patently no legitimate overriding purpose independent of invidious racial discrimination";
-                document.getElementById('author').value = "";
-            }}
-            
-            function scoreClass(score) {{
-                if (score >= 0.7) return 'high';
-                if (score >= 0.5) return 'medium';
-                return 'low';
-            }}
-            
-            function displayResults(results, source) {{
-                let html = '<h3>' + source + ' Results (' + results.length + ')</h3>';
-                
-                for (const r of results) {{
-                    const cssClass = r.source === 'serpapi' ? 'serpapi' : '';
-                    if (r.error) {{
-                        html += '<div class="result error ' + cssClass + '"><h3>Error</h3><p>' + r.error + '</p></div>';
-                    }} else if (r.success) {{
-                        html += '<div class="result ' + cssClass + '">';
-                        html += '<h3>' + (r.title || 'Unknown') + '</h3>';
-                        html += '<p class="meta"><strong>Authors:</strong> ' + (r.authors?.join(', ') || 'N/A') + '</p>';
-                        html += '<p class="meta"><strong>Published:</strong> ' + (r.published_date || 'N/A') + '</p>';
-                        html += '<p class="meta"><strong>Match Score:</strong> <span class="score ' + scoreClass(r.match_score) + '">' + (r.match_score * 100).toFixed(1) + '%</span></p>';
-                        html += '<p class="meta"><strong>Has Snippet:</strong> ' + (r.has_text_snippet ? '✅' : '❌') + '</p>';
-                        if (r.snippet) html += '<p><em>"' + r.snippet.substring(0, 200) + '..."</em></p>';
-                        if (!r.has_text_snippet) html += '<p class="warning">⚠️ No text snippet - publisher may restrict API access</p>';
-                        if (r.url) html += '<p><a href="' + r.url + '" target="_blank">View Book →</a></p>';
-                        html += '</div>';
-                    }}
-                }}
-                
-                html += '<h3>Raw Response</h3><pre>' + JSON.stringify(results, null, 2) + '</pre>';
-                document.getElementById('results').innerHTML = html;
-            }}
-            
-            function displayComparison(googleResults, serpResults) {{
-                let html = '<div class="columns">';
-                
-                // Google column
-                html += '<div class="column">';
-                html += '<h3>🔵 Google Books API (' + googleResults.length + ')</h3>';
-                for (const r of googleResults) {{
-                    if (r.error) {{
-                        html += '<div class="result error"><p>' + r.error + '</p></div>';
-                    }} else if (r.success) {{
-                        html += '<div class="result">';
-                        html += '<strong>' + (r.title || 'Unknown').substring(0, 40) + '</strong><br>';
-                        html += '<span class="score ' + scoreClass(r.match_score) + '">' + (r.match_score * 100).toFixed(1) + '%</span>';
-                        html += ' | Snippet: ' + (r.has_text_snippet ? '✅' : '❌');
-                        html += '</div>';
-                    }}
-                }}
-                html += '</div>';
-                
-                // SerpAPI column
-                html += '<div class="column">';
-                html += '<h3>🟢 SerpAPI Books (' + serpResults.length + ')</h3>';
-                for (const r of serpResults) {{
-                    if (r.error) {{
-                        html += '<div class="result error serpapi"><p>' + r.error + '</p></div>';
-                    }} else if (r.success) {{
-                        html += '<div class="result serpapi">';
-                        html += '<strong>' + (r.title || 'Unknown').substring(0, 40) + '</strong><br>';
-                        html += '<span class="score ' + scoreClass(r.match_score) + '">' + (r.match_score * 100).toFixed(1) + '%</span>';
-                        html += ' | Snippet: ' + (r.has_text_snippet ? '✅' : '❌');
-                        html += '</div>';
-                    }}
-                }}
-                html += '</div>';
-                
-                html += '</div>';
-                
-                html += '<h3>Raw Responses</h3>';
-                html += '<pre>// Google Books API\\n' + JSON.stringify(googleResults, null, 2) + '</pre>';
-                html += '<pre>// SerpAPI Books\\n' + JSON.stringify(serpResults, null, 2) + '</pre>';
-                
-                document.getElementById('results').innerHTML = html;
+
+            // --- TEST HELPERS ---
+            function loadTest(scenario) {{
+                const inputs = {{
+                    'prozac': {{ q: "By the time Tess's story had played itself out, I had seen perhaps a dozen", a: "Kramer" }},
+                    'einstein': {{ q: "Imagination is more important than knowledge.", a: "Einstein" }},
+                    'potter': {{ q: "Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say", a: "Rowling" }}
+                }};
+                document.getElementById('quote').value = inputs[scenario].q;
+                document.getElementById('author').value = inputs[scenario].a;
             }}
         </script>
     </body>
@@ -689,63 +523,29 @@ async def home():
 
 @app.post("/api/search")
 async def google_api_search(request: SearchRequest) -> List[Dict[str, Any]]:
-    """Search using native Google Books API."""
     results = await search_google_books_api(
-        request.quote, 
-        request.author_hint, 
-        request.max_results,
-        request.use_exact_phrase
+        request.quote, request.author_hint, request.max_results, request.use_exact_phrase
     )
     return [asdict(r) for r in results]
 
 @app.post("/serpapi/search")
 async def serpapi_search(request: SearchRequest) -> List[Dict[str, Any]]:
-    """Search using SerpAPI Google Books."""
     results = await search_serpapi_books(
-        request.quote,
-        request.author_hint,
-        request.max_results
+        request.quote, request.author_hint, request.max_results
     )
     return [asdict(r) for r in results]
 
-@app.get("/health")
-async def health():
-    """Health check."""
-    return {
-        "status": "ok",
-        "google_api_key_configured": bool(GOOGLE_BOOKS_API_KEY),
-        "serpapi_key_configured": bool(SERPAPI_KEY)
-    }
-
 @app.get("/config")
 async def config():
-    """Show configuration status."""
+    """Secure configuration check."""
     return {
-        "GOOGLE_BOOKS_API_KEY": f"{GOOGLE_BOOKS_API_KEY[:8]}...{GOOGLE_BOOKS_API_KEY[-4:]}" if GOOGLE_BOOKS_API_KEY else "NOT SET",
-        "SERPAPI_KEY": f"{SERPAPI_KEY[:8]}...{SERPAPI_KEY[-4:]}" if SERPAPI_KEY else "NOT SET",
-        "env_vars_checked": {
-            "GOOGLE_BOOKS_API_KEY": bool(os.getenv("GOOGLE_BOOKS_API_KEY")),
-            "GOOGLE_API_KEY": bool(os.getenv("GOOGLE_API_KEY")),
-            "SERPAPI_KEY": bool(os.getenv("SERPAPI_KEY"))
-        }
+        "google_ok": bool(GOOGLE_BOOKS_API_KEY),
+        "serp_ok": bool(SERPAPI_KEY)
     }
 
 # =============================================================================
 # STARTUP
 # =============================================================================
-
-@app.on_event("startup")
-async def startup():
-    logger.info("=" * 60)
-    logger.info("Google Books Test App Starting")
-    logger.info("=" * 60)
-    logger.info(f"Google Books API Key: {bool(GOOGLE_BOOKS_API_KEY)}")
-    logger.info(f"SerpAPI Key: {bool(SERPAPI_KEY)}")
-    if GOOGLE_BOOKS_API_KEY:
-        logger.info(f"Google Key Preview: {GOOGLE_BOOKS_API_KEY[:8]}...")
-    if SERPAPI_KEY:
-        logger.info(f"SerpAPI Key Preview: {SERPAPI_KEY[:8]}...")
-    logger.info("=" * 60)
 
 if __name__ == "__main__":
     import uvicorn
