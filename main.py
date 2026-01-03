@@ -124,19 +124,20 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
     3. Short Quote (First 15 words) + Author
     """
     trace = []
-    clean_q = clean_quote_text(quote)[:120]
-    short_q = " ".join(clean_q.split()[:15]) # First 15 words
+    clean_q = clean_quote_text(quote)  # Full quote, no truncation
+    short_q = " ".join(clean_q.split()[:15]) # First 15 words as fallback
     
     strategies = [
         {"name": "Full Quote + Author", "q": clean_q, "auth": author},
-        {"name": "Full Quote Only (Relaxed Author)", "q": clean_q, "auth": None},
+        {"name": "Full Quote Only", "q": clean_q, "auth": None},
         {"name": "Short Fragment + Author", "q": short_q, "auth": author},
+        {"name": "Short Fragment Only", "q": short_q, "auth": None},
     ]
     
     async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
         for strategy in strategies:
-            # Skip if strategy is invalid (e.g. no author provided)
-            if strategy["name"].endswith("Author") and not author:
+            # Skip author strategies if no author provided
+            if strategy["auth"] is not None and not author:
                 continue
 
             query = f'"{strategy["q"]}"' # Use exact phrase matching
