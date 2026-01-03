@@ -37,6 +37,7 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 GOOGLE_BOOKS_BASE_URL = "https://www.googleapis.com/books/v1/volumes"
 SERPAPI_BASE_URL = "https://serpapi.com/search"
 API_TIMEOUT = 30.0
+MATCH_THRESHOLD = 0.90  # 90% minimum match score
 
 # =============================================================================
 # DATA CLASSES
@@ -107,7 +108,7 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
     3. Short Quote (First 15 words) + Author
     """
     trace = []
-    clean_q = clean_quote_text(quote)
+    clean_q = clean_quote_text(quote)[:120]
     short_q = " ".join(clean_q.split()[:15]) # First 15 words
     
     strategies = [
@@ -136,11 +137,16 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                 items = data.get("items", [])
                 
                 if items:
-                    trace.append(f"✅ Success! Found {len(items)} results.")
-                    return SearchResponse(
-                        results=parse_google_items(items, quote),
-                        trace=trace
-                    )
+                    parsed = parse_google_items(items, quote)
+                    # Filter to only matches meeting 90% threshold
+                    verified = [r for r in parsed if r.match_score >= MATCH_THRESHOLD]
+                    
+                    if verified:
+                        trace.append(f"✅ Found {len(verified)} verified match(es) ≥{int(MATCH_THRESHOLD*100)}%")
+                        return SearchResponse(results=verified, trace=trace)
+                    else:
+                        scores = [f"{int(r.match_score*100)}%" for r in parsed]
+                        trace.append(f"❌ {len(items)} results but none ≥{int(MATCH_THRESHOLD*100)}% (scores: {', '.join(scores)})")
                 else:
                     trace.append("❌ 0 results.")
             except Exception as e:
