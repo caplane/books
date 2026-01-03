@@ -181,7 +181,7 @@ async def search_google_books_api(
     
     # Build query - CLEAN THE QUOTE FIRST
     clean_text = clean_quote_text(quote_text)
-    search_text = clean_text[:60].strip()
+    search_text = clean_text[:200].strip()
     
     if use_exact_phrase:
         query = f'"{search_text}"'
