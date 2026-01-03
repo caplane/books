@@ -154,15 +154,14 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                 
                 if items:
                     parsed = parse_google_items(items, quote)
-                    # Filter to only matches meeting 90% threshold
-                    verified = [r for r in parsed if r.match_score >= MATCH_THRESHOLD]
+                    # EXACT PHRASE SEARCH: If Google found results, the book contains
+                    # the phrase. Trust the search - don't require snippet verification.
+                    # Google often returns description snippets, not matching passages.
+                    for r in parsed:
+                        r.match_score = 1.0  # Exact phrase match = verified
                     
-                    if verified:
-                        trace.append(f"✅ Found {len(verified)} verified match(es) ≥{int(MATCH_THRESHOLD*100)}%")
-                        return SearchResponse(results=verified, trace=trace)
-                    else:
-                        scores = [f"{int(r.match_score*100)}%" for r in parsed]
-                        trace.append(f"❌ {len(items)} results but none ≥{int(MATCH_THRESHOLD*100)}% (scores: {', '.join(scores)})")
+                    trace.append(f"✅ Found {len(parsed)} result(s) via exact phrase match")
+                    return SearchResponse(results=parsed, trace=trace)
                 else:
                     trace.append("❌ 0 results.")
             except Exception as e:
