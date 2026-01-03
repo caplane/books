@@ -125,13 +125,19 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
     """
     trace = []
     clean_q = clean_quote_text(quote)  # Full quote, no truncation
-    short_q = " ".join(clean_q.split()[:15]) # First 15 words as fallback
+    words = clean_q.split()
+    short_q = " ".join(words[:15])  # First 15 words
+    # Second half of quote (often has more distinctive content)
+    mid = len(words) // 2
+    last_q = " ".join(words[mid:]) if len(words) > 20 else short_q
     
     strategies = [
         {"name": "Full Quote + Author", "q": clean_q, "auth": author},
         {"name": "Full Quote Only", "q": clean_q, "auth": None},
-        {"name": "Short Fragment + Author", "q": short_q, "auth": author},
-        {"name": "Short Fragment Only", "q": short_q, "auth": None},
+        {"name": "First Fragment + Author", "q": short_q, "auth": author},
+        {"name": "First Fragment Only", "q": short_q, "auth": None},
+        {"name": "Second Half + Author", "q": last_q, "auth": author},
+        {"name": "Second Half Only", "q": last_q, "auth": None},
     ]
     
     async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
