@@ -98,7 +98,8 @@ class SearchRequest(BaseModel):
 
 # Pattern for dashes that should split text (like ellipsis does)
 # Em-dash often joins clauses without spaces: "basin—Seymour"
-DASH_SPLIT_PATTERN = re.compile(r'[—–―]')  # U+2014 em-dash, U+2013 en-dash, U+2015 horizontal bar
+# Also catches hyphen since browsers/forms often convert em-dash to hyphen
+DASH_SPLIT_PATTERN = re.compile(r'[-—–―]')  # Hyphen, em-dash, en-dash, horizontal bar
 
 
 def clean_quote_text(text: str) -> str:
