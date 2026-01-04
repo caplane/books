@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Google Books Standalone Test App (v1.3 - Unicode + Fuzzy Matching)
-==================================================================
+Google Books Standalone Test App (v1.4 - Distinctive Word Anchoring)
+=====================================================================
+REVISIONS v1.4:
+- Search anchored to most distinctive word (drug names, citations, etc.)
+- 200-char window extracted from distinctive word position
+- Replaces arbitrary positional fragments (first 15 words, second half)
 REVISIONS v1.3:
 - NFC Unicode normalization (preserves §, ¶, accented chars)
 - Fuzzy matching phase with 90% threshold (handles typos/OCR errors)
 - Keyword fallback with 50% threshold
-- Identical logic to google_books.py engine
 """
 
 import os
@@ -140,6 +143,100 @@ def extract_keywords_for_search(text: str, max_keywords: int = 10) -> List[str]:
     return keywords[:max_keywords]
 
 
+def score_word_distinctiveness(word: str) -> int:
+    """
+    Score a word's distinctiveness for search anchor selection.
+    Higher score = more distinctive = better search anchor.
+    
+    Scoring hierarchy:
+    - Drug/chemical names: 100
+    - Legal citations (§): 90
+    - Numbers (statute refs, years): 80
+    - Long words (10+ chars): 70
+    - Medium words (7-9 chars): 50
+    - Proper nouns (capitalized): 40
+    - Short words not in stop list: 20
+    - Stop words: 0
+    """
+    word_lower = word.lower().strip()
+    word_clean = re.sub(r'[^\w]', '', word_lower)
+    
+    if not word_clean or len(word_clean) < 2:
+        return 0
+    
+    if word_lower in STOP_WORDS:
+        return 0
+    
+    # Drug/chemical patterns (ends in -ine, -one, -ole, -ate, -ide, etc.)
+    drug_suffixes = ('pirone', 'prine', 'zepam', 'olan', 'etine', 'amine', 
+                     'azole', 'mycin', 'cillin', 'statin', 'pril', 'sartan',
+                     'olol', 'dipine', 'oxacin', 'cycline', 'dronate')
+    if any(word_lower.endswith(suffix) for suffix in drug_suffixes):
+        return 100
+    
+    # Legal citation symbols
+    if '§' in word or word_lower in ('u.s.', 'm.r.s.', 'f.2d', 'f.3d', 'f.supp'):
+        return 90
+    
+    # Numbers (statute references, years, etc.)
+    if re.match(r'^\d+$', word_clean):
+        if len(word_clean) == 4:  # Year
+            return 85
+        return 80
+    
+    # Long words are usually more distinctive
+    if len(word_clean) >= 10:
+        return 70
+    
+    if len(word_clean) >= 7:
+        return 50
+    
+    # Capitalized words (proper nouns) - check original word
+    if word and word[0].isupper() and len(word_clean) >= 3:
+        return 40
+    
+    # Everything else not in stop words
+    if len(word_clean) >= 3:
+        return 20
+    
+    return 0
+
+
+def extract_distinctive_window(text: str, max_chars: int = 200) -> str:
+    """
+    Extract a search window starting from the most distinctive word.
+    
+    Returns up to max_chars starting from the highest-scoring word's position.
+    """
+    if len(text) <= max_chars:
+        return text
+    
+    # Tokenize while preserving positions
+    words_with_pos = []
+    for match in re.finditer(r'\S+', text):
+        words_with_pos.append((match.group(), match.start(), match.end()))
+    
+    if not words_with_pos:
+        return text[:max_chars]
+    
+    # Score each word
+    best_score = -1
+    best_pos = 0
+    
+    for word, start, end in words_with_pos:
+        score = score_word_distinctiveness(word)
+        if score > best_score:
+            best_score = score
+            best_pos = start
+    
+    # Extract window starting at best position
+    window = text[best_pos:best_pos + max_chars]
+    
+    logger.info(f"Distinctive window: score={best_score}, starts at char {best_pos}: '{window[:50]}...'")
+    
+    return window
+
+
 def compute_match_score(user_quote: str, source_text: str) -> float:
     """Robust containment check."""
     if not user_quote or not source_text: return 0.0
@@ -244,26 +341,26 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
 async def search_google_books_cascading(quote: str, author: str) -> SearchResponse:
     """
     Tries multiple search strategies until one works:
-    1. Exact phrase strategies (quoted, trusted)
-    2. Fuzzy strategies (unquoted, 90% threshold)
+    1. Distinctive window (200 chars from most distinctive word)
+    2. Fuzzy matching (90% threshold)
     3. Keyword fallback (50% threshold)
     """
     trace = []
-    clean_q = clean_quote_text(quote)  # Full quote, no truncation
-    words = clean_q.split()
-    short_q = " ".join(words[:15])  # First 15 words
-    # Second half of quote (often has more distinctive content)
-    mid = len(words) // 2
-    last_q = " ".join(words[mid:]) if len(words) > 20 else short_q
+    clean_q = clean_quote_text(quote)
+    
+    # Extract 200-char window starting from most distinctive word
+    distinctive_q = extract_distinctive_window(clean_q, max_chars=200)
+    
+    # Also prepare shorter fragment for fallback
+    words = distinctive_q.split()
+    short_q = " ".join(words[:15]) if len(words) > 15 else distinctive_q
     
     # PHASE 1: Exact phrase strategies (trusted, match_score = 1.0)
     exact_strategies = [
-        {"name": "Full Quote + Author", "q": clean_q, "auth": author},
-        {"name": "Full Quote Only", "q": clean_q, "auth": None},
-        {"name": "First Fragment + Author", "q": short_q, "auth": author},
-        {"name": "First Fragment Only", "q": short_q, "auth": None},
-        {"name": "Second Half + Author", "q": last_q, "auth": author},
-        {"name": "Second Half Only", "q": last_q, "auth": None},
+        {"name": "Distinctive Window + Author", "q": distinctive_q, "auth": author},
+        {"name": "Distinctive Window Only", "q": distinctive_q, "auth": None},
+        {"name": "Short Fragment + Author", "q": short_q, "auth": author},
+        {"name": "Short Fragment Only", "q": short_q, "auth": None},
     ]
     
     async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
@@ -302,9 +399,8 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
         trace.append("Exact phrase exhausted, trying fuzzy matching...")
         
         fuzzy_strategies = [
-            {"name": "Fuzzy Full Quote", "q": clean_q},
-            {"name": "Fuzzy First Fragment", "q": short_q},
-            {"name": "Fuzzy Second Half", "q": last_q},
+            {"name": "Fuzzy Distinctive Window", "q": distinctive_q},
+            {"name": "Fuzzy Short Fragment", "q": short_q},
         ]
         
         for strategy in fuzzy_strategies:
