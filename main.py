@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Google Books Standalone Test App (v1.5 - Dynamic Threshold)
+Google Books Standalone Test App (v1.6 - Em-dash Splitting)
 ============================================================
+REVISIONS v1.6:
+- Split at em-dashes before extracting distinctive window
+- Fixes: "basin—Seymour" no longer blocks finding "buspirone"
 REVISIONS v1.5:
 - Dynamic match threshold adjusts for quote/snippet length mismatch
-- Fixes false negatives when long quotes compared to short snippets
 REVISIONS v1.4:
 - Search anchored to most distinctive word (drug names, citations, etc.)
 - 200-char window extracted from distinctive word position
@@ -94,17 +96,41 @@ class SearchRequest(BaseModel):
 # LOGIC & HELPERS
 # =============================================================================
 
+# Pattern for dashes that should split text (like ellipsis does)
+# Em-dash often joins clauses without spaces: "basin—Seymour"
+DASH_SPLIT_PATTERN = re.compile(r'[—–―]')  # U+2014 em-dash, U+2013 en-dash, U+2015 horizontal bar
+
+
 def clean_quote_text(text: str) -> str:
     """Clean special characters for API acceptance while preserving Unicode symbols."""
     text = text.strip().strip('"').strip('\u201C').strip('\u201D')
     text = text.replace('\u2019', "'").replace('\u2018', "'")  # Curly apostrophes
     text = text.replace('\u201c', '"').replace('\u201d', '"')  # Curly quotes
-    text = text.replace('\u2014', '-').replace('\u2013', '-')  # Dashes to hyphen
+    # NOTE: We no longer convert em-dash to hyphen here - we split at it instead
     # Remove double quotes (we wrap in our own for exact phrase search)
     text = text.replace('"', '')
     # Normalize Unicode to NFC (preserves §, ¶, accented chars)
     text = unicodedata.normalize('NFC', text)
     return ' '.join(text.split())  # Normalize whitespace
+
+
+def split_at_dashes(text: str) -> str:
+    """
+    Split text at em-dashes and return the segment with the most distinctive word.
+    
+    Em-dashes often join clauses without spaces ("basin—Seymour"), which creates
+    tokens that won't match the source text. Like ellipsis handling, we split
+    and take the best segment.
+    
+    Example:
+        Input:  "One for the basin—Seymour stops taking the buspirone."
+        Output: "Seymour stops taking the buspirone."  (has buspirone, score 100)
+    
+    NOTE: This function calls score_word_distinctiveness, so it must be defined
+    after that function. We use a forward reference pattern here.
+    """
+    # Defer to implementation after score_word_distinctiveness is defined
+    return _split_at_dashes_impl(text)
 
 
 # Stop words for keyword extraction fallback
@@ -173,7 +199,7 @@ def score_word_distinctiveness(word: str) -> int:
     drug_suffixes = ('pirone', 'prine', 'zepam', 'olan', 'etine', 'amine', 
                      'azole', 'mycin', 'cillin', 'statin', 'pril', 'sartan',
                      'olol', 'dipine', 'oxacin', 'cycline', 'dronate')
-    if any(word_lower.endswith(suffix) for suffix in drug_suffixes):
+    if any(word_clean.endswith(suffix) for suffix in drug_suffixes):
         return 100
     
     # Legal citation symbols
@@ -202,6 +228,39 @@ def score_word_distinctiveness(word: str) -> int:
         return 20
     
     return 0
+
+
+def _split_at_dashes_impl(text: str) -> str:
+    """
+    Implementation of split_at_dashes (called after score_word_distinctiveness is defined).
+    """
+    if not DASH_SPLIT_PATTERN.search(text):
+        return text
+    
+    segments = DASH_SPLIT_PATTERN.split(text)
+    segments = [s.strip() for s in segments if s.strip()]
+    
+    if not segments:
+        return text
+    
+    if len(segments) == 1:
+        return segments[0]
+    
+    # Find segment with highest distinctiveness score
+    best_segment = segments[0]
+    best_score = -1
+    
+    for seg in segments:
+        # Score each word in segment, take max
+        for match in re.finditer(r'\S+', seg):
+            word = match.group()
+            score = score_word_distinctiveness(word)
+            if score > best_score:
+                best_score = score
+                best_segment = seg
+    
+    logger.info(f"Split at dash: {len(segments)} segments, best score={best_score}, selected: '{best_segment[:50]}...'")
+    return best_segment
 
 
 def extract_distinctive_window(text: str, max_chars: int = 200) -> str:
@@ -375,12 +434,17 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
     trace = []
     clean_q = clean_quote_text(quote)
     
+    # Split at em-dashes and take segment with most distinctive word
+    clean_q = split_at_dashes(clean_q)
+    
     # Extract 200-char window starting from most distinctive word
     distinctive_q = extract_distinctive_window(clean_q, max_chars=200)
     
     # Also prepare shorter fragment for fallback
     words = distinctive_q.split()
     short_q = " ".join(words[:15]) if len(words) > 15 else distinctive_q
+    
+    trace.append(f"Search window: {distinctive_q[:60]}...")
     
     # PHASE 1: Exact phrase strategies (trusted, match_score = 1.0)
     exact_strategies = [
