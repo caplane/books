@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Google Books Standalone Test App (v1.2 - The "Cascading" Fix)
-=============================================================
-REVISIONS v1.2:
-- Implemented "Cascading Search": If exact match fails, it automatically
-  retries with broader criteria (dropping author, shortening text).
-- Added "Search Trace" to UI: Shows user exactly which attempts failed.
+Google Books Standalone Test App (v1.3 - Unicode + Fuzzy Matching)
+==================================================================
+REVISIONS v1.3:
+- NFC Unicode normalization (preserves §, ¶, accented chars)
+- Fuzzy matching phase with 90% threshold (handles typos/OCR errors)
+- Keyword fallback with 50% threshold
+- Identical logic to google_books.py engine
 """
 
 import os
 import re
 import html
 import logging
+import unicodedata
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field, asdict
 from difflib import SequenceMatcher
@@ -77,7 +79,7 @@ class SearchResponse:
 # FASTAPI APP
 # =============================================================================
 
-app = FastAPI(title="Google Books Test App v1.2")
+app = FastAPI(title="Google Books Test App v1.3")
 
 class SearchRequest(BaseModel):
     quote: str
@@ -88,12 +90,55 @@ class SearchRequest(BaseModel):
 # =============================================================================
 
 def clean_quote_text(text: str) -> str:
-    """Aggressive cleaning to ensure API acceptance."""
+    """Clean special characters for API acceptance while preserving Unicode symbols."""
     text = text.strip().strip('"').strip('\u201C').strip('\u201D')
-    text = text.replace('\u2019', "'").replace('\u2018', "'") # Apostrophes
-    text = text.replace('\u2014', ' ').replace('\u2013', ' ') # Dashes to space
-    text = text.encode('ascii', 'ignore').decode('ascii')     # Remove non-ascii
-    return text.strip()
+    text = text.replace('\u2019', "'").replace('\u2018', "'")  # Curly apostrophes
+    text = text.replace('\u201c', '"').replace('\u201d', '"')  # Curly quotes
+    text = text.replace('\u2014', '-').replace('\u2013', '-')  # Dashes to hyphen
+    # Remove double quotes (we wrap in our own for exact phrase search)
+    text = text.replace('"', '')
+    # Normalize Unicode to NFC (preserves §, ¶, accented chars)
+    text = unicodedata.normalize('NFC', text)
+    return ' '.join(text.split())  # Normalize whitespace
+
+
+# Stop words for keyword extraction fallback
+STOP_WORDS = {
+    'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'by', 'at', 'and', 'or',
+    'is', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do',
+    'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must',
+    'shall', 'can', 'this', 'that', 'these', 'those', 'it', 'its', 'with',
+    'as', 'from', 'are', 'not', 'but', 'if', 'then', 'than', 'so', 'no',
+    'yes', 'all', 'any', 'each', 'which', 'who', 'whom', 'what', 'when',
+    'where', 'why', 'how', 'out', 'said', 'says', 'told', 'asked', 'replied',
+    'thought', 'knew', 'saw', 'came', 'went', 'made', 'took', 'gave', 'got',
+    'man', 'men', 'woman', 'women', 'people', 'thing', 'things', 'time', 'way',
+}
+
+
+def extract_keywords_for_search(text: str, max_keywords: int = 10) -> List[str]:
+    """Extract distinctive keywords from quote text for fallback search."""
+    keywords = []
+    seen = set()
+    
+    def add_keyword(word: str):
+        word_lower = word.lower().strip()
+        if word_lower and word_lower not in seen and len(word_lower) > 2 and word_lower not in STOP_WORDS:
+            keywords.append(word_lower)
+            seen.add(word_lower)
+    
+    # Priority 1: Extract 4-digit years
+    years = re.findall(r'\b(1[0-9]{3}|20[0-2][0-9])\b', text)
+    for year in years:
+        add_keyword(year)
+    
+    # Priority 2: Extract remaining distinctive words
+    text_clean = re.sub(r'[^\w\s]', ' ', text[:300].lower())
+    for word in text_clean.split():
+        add_keyword(word)
+    
+    return keywords[:max_keywords]
+
 
 def compute_match_score(user_quote: str, source_text: str) -> float:
     """Robust containment check."""
@@ -198,10 +243,10 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
 
 async def search_google_books_cascading(quote: str, author: str) -> SearchResponse:
     """
-    Tries multiple search strategies until one works.
-    1. Full Quote + Author
-    2. Full Quote (No Author)
-    3. Short Quote (First 15 words) + Author
+    Tries multiple search strategies until one works:
+    1. Exact phrase strategies (quoted, trusted)
+    2. Fuzzy strategies (unquoted, 90% threshold)
+    3. Keyword fallback (50% threshold)
     """
     trace = []
     clean_q = clean_quote_text(quote)  # Full quote, no truncation
@@ -211,7 +256,8 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
     mid = len(words) // 2
     last_q = " ".join(words[mid:]) if len(words) > 20 else short_q
     
-    strategies = [
+    # PHASE 1: Exact phrase strategies (trusted, match_score = 1.0)
+    exact_strategies = [
         {"name": "Full Quote + Author", "q": clean_q, "auth": author},
         {"name": "Full Quote Only", "q": clean_q, "auth": None},
         {"name": "First Fragment + Author", "q": short_q, "auth": author},
@@ -221,12 +267,12 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
     ]
     
     async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
-        for strategy in strategies:
+        for strategy in exact_strategies:
             # Skip author strategies if no author provided
             if strategy["auth"] is not None and not author:
                 continue
 
-            query = f'"{strategy["q"]}"' # Use exact phrase matching
+            query = f'"{strategy["q"]}"'  # Exact phrase matching
             if strategy["auth"]:
                 query += f" inauthor:{strategy['auth']}"
             
@@ -234,23 +280,92 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
             
             try:
                 resp = await client.get(GOOGLE_BOOKS_BASE_URL, params={
-                    "q": query, "key": GOOGLE_BOOKS_API_KEY, "maxResults": 3, "printType": "books"
+                    "q": query, "key": GOOGLE_BOOKS_API_KEY, "maxResults": 5, "printType": "books"
                 })
                 data = resp.json()
                 items = data.get("items", [])
                 
                 if items:
                     parsed = parse_google_items(items, quote)
-                    # EXACT PHRASE SEARCH: If Google found results, the book contains
-                    # the phrase. Trust the search - don't require snippet verification.
-                    # Google often returns description snippets, not matching passages.
+                    # EXACT PHRASE SEARCH: Trust the match
                     for r in parsed:
-                        r.match_score = 1.0  # Exact phrase match = verified
+                        r.match_score = 1.0
                     
                     trace.append(f"✅ Found {len(parsed)} result(s) via exact phrase match")
                     return SearchResponse(results=parsed, trace=trace)
                 else:
                     trace.append("❌ 0 results.")
+            except Exception as e:
+                trace.append(f"⚠️ Error: {str(e)}")
+        
+        # PHASE 2: Fuzzy strategies (no quotes, verify with 90% threshold)
+        trace.append("Exact phrase exhausted, trying fuzzy matching...")
+        
+        fuzzy_strategies = [
+            {"name": "Fuzzy Full Quote", "q": clean_q},
+            {"name": "Fuzzy First Fragment", "q": short_q},
+            {"name": "Fuzzy Second Half", "q": last_q},
+        ]
+        
+        for strategy in fuzzy_strategies:
+            search_query = strategy["q"]  # NO quotes = fuzzy matching
+            if author:
+                search_query += f" inauthor:{author}"
+            
+            trace.append(f"Trying: {strategy['name']}...")
+            
+            try:
+                resp = await client.get(GOOGLE_BOOKS_BASE_URL, params={
+                    "q": search_query, "key": GOOGLE_BOOKS_API_KEY, "maxResults": 5, "printType": "books"
+                })
+                data = resp.json()
+                items = data.get("items", [])
+                
+                if items:
+                    parsed = parse_google_items(items, quote)
+                    # Filter by 90% threshold
+                    verified = [r for r in parsed if r.match_score >= MATCH_THRESHOLD]
+                    
+                    if verified:
+                        trace.append(f"✅ Found {len(verified)} result(s) above {int(MATCH_THRESHOLD*100)}% threshold")
+                        return SearchResponse(results=verified, trace=trace)
+                    else:
+                        trace.append(f"❌ {len(parsed)} results but none above {int(MATCH_THRESHOLD*100)}% threshold")
+                else:
+                    trace.append("❌ 0 results.")
+            except Exception as e:
+                trace.append(f"⚠️ Error: {str(e)}")
+        
+        # PHASE 3: Keyword fallback (50% threshold)
+        trace.append("Fuzzy matching exhausted, trying keyword fallback...")
+        keywords = extract_keywords_for_search(quote, max_keywords=10)
+        
+        if keywords:
+            keyword_query = ' '.join(keywords)
+            if author:
+                keyword_query += f" inauthor:{author}"
+            
+            trace.append(f"Keywords: {keyword_query}")
+            
+            try:
+                resp = await client.get(GOOGLE_BOOKS_BASE_URL, params={
+                    "q": keyword_query, "key": GOOGLE_BOOKS_API_KEY, "maxResults": 5, "printType": "books"
+                })
+                data = resp.json()
+                items = data.get("items", [])
+                
+                if items:
+                    parsed = parse_google_items(items, quote)
+                    # Lower threshold for keyword fallback
+                    verified = [r for r in parsed if r.match_score >= 0.50]
+                    
+                    if verified:
+                        trace.append(f"✅ Found {len(verified)} result(s) via keyword fallback")
+                        return SearchResponse(results=verified, trace=trace)
+                    else:
+                        trace.append("❌ Keyword results below 50% threshold")
+                else:
+                    trace.append("❌ 0 keyword results.")
             except Exception as e:
                 trace.append(f"⚠️ Error: {str(e)}")
 
