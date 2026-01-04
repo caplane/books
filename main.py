@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Google Books Standalone Test App (v1.4 - Distinctive Word Anchoring)
-=====================================================================
+Google Books Standalone Test App (v1.5 - Dynamic Threshold)
+============================================================
+REVISIONS v1.5:
+- Dynamic match threshold adjusts for quote/snippet length mismatch
+- Fixes false negatives when long quotes compared to short snippets
 REVISIONS v1.4:
 - Search anchored to most distinctive word (drug names, citations, etc.)
 - 200-char window extracted from distinctive word position
-- Replaces arbitrary positional fragments (first 15 words, second half)
 REVISIONS v1.3:
 - NFC Unicode normalization (preserves §, ¶, accented chars)
 - Fuzzy matching phase with 90% threshold (handles typos/OCR errors)
@@ -237,6 +239,31 @@ def extract_distinctive_window(text: str, max_chars: int = 200) -> str:
     return window
 
 
+def compute_dynamic_threshold(quote_len: int, snippet_len: int, base_threshold: float = 0.90) -> float:
+    """
+    Adjust match threshold based on length ratio.
+    
+    SequenceMatcher.ratio() = 2 * matches / (len_a + len_b)
+    When snippet is shorter than quote, perfect overlap is capped.
+    
+    Example: quote=350, snippet=200, perfect overlap=200 chars
+             max_ratio = 2*200 / (350+200) = 0.727
+             
+    We require base_threshold (90%) of what's theoretically achievable.
+    """
+    if snippet_len >= quote_len:
+        return base_threshold
+    
+    # Max possible ratio for perfect overlap of shorter string
+    max_possible = (2 * snippet_len) / (quote_len + snippet_len)
+    
+    # Require 90% of what's theoretically achievable
+    adjusted = base_threshold * max_possible
+    
+    # Floor at 40% to avoid false positives
+    return max(adjusted, 0.40)
+
+
 def compute_match_score(user_quote: str, source_text: str) -> float:
     """Robust containment check."""
     if not user_quote or not source_text: return 0.0
@@ -419,20 +446,27 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                 
                 if items:
                     parsed = parse_google_items(items, quote)
-                    # Filter by 90% threshold
-                    verified = [r for r in parsed if r.match_score >= MATCH_THRESHOLD]
+                    # Filter by DYNAMIC threshold (adjusts for length mismatch)
+                    quote_len = len(quote)
+                    verified = []
+                    for r in parsed:
+                        snippet_len = len(r.snippet) if r.snippet else 0
+                        threshold = compute_dynamic_threshold(quote_len, snippet_len)
+                        if r.match_score >= threshold:
+                            verified.append(r)
+                            trace.append(f"   ↳ '{r.title[:30]}...' score={r.match_score:.2f} >= threshold={threshold:.2f}")
                     
                     if verified:
-                        trace.append(f"✅ Found {len(verified)} result(s) above {int(MATCH_THRESHOLD*100)}% threshold")
+                        trace.append(f"✅ Found {len(verified)} result(s) above dynamic threshold")
                         return SearchResponse(results=verified, trace=trace)
                     else:
-                        trace.append(f"❌ {len(parsed)} results but none above {int(MATCH_THRESHOLD*100)}% threshold")
+                        trace.append(f"❌ {len(parsed)} results but none above dynamic threshold")
                 else:
                     trace.append("❌ 0 results.")
             except Exception as e:
                 trace.append(f"⚠️ Error: {str(e)}")
         
-        # PHASE 3: Keyword fallback (50% threshold)
+        # PHASE 3: Keyword fallback (dynamic threshold, base 50%)
         trace.append("Fuzzy matching exhausted, trying keyword fallback...")
         keywords = extract_keywords_for_search(quote, max_keywords=10)
         
@@ -452,14 +486,20 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                 
                 if items:
                     parsed = parse_google_items(items, quote)
-                    # Lower threshold for keyword fallback
-                    verified = [r for r in parsed if r.match_score >= 0.50]
+                    # Dynamic threshold with lower base for keyword fallback
+                    quote_len = len(quote)
+                    verified = []
+                    for r in parsed:
+                        snippet_len = len(r.snippet) if r.snippet else 0
+                        threshold = compute_dynamic_threshold(quote_len, snippet_len, base_threshold=0.50)
+                        if r.match_score >= threshold:
+                            verified.append(r)
                     
                     if verified:
                         trace.append(f"✅ Found {len(verified)} result(s) via keyword fallback")
                         return SearchResponse(results=verified, trace=trace)
                     else:
-                        trace.append("❌ Keyword results below 50% threshold")
+                        trace.append("❌ Keyword results below dynamic threshold")
                 else:
                     trace.append("❌ 0 keyword results.")
             except Exception as e:
