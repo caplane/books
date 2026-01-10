@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Google Books Standalone Test App (v1.6 - Em-dash Splitting)
-============================================================
+Google Books Standalone Test App (v2.0 - Aligned with CourtListener)
+=====================================================================
+REVISIONS v2.0:
+- Added Phase 0 anchor window search (typo-resistant case identification)
+- Added best_results tracking across all phases (returns with warning if no threshold met)
+- Added source_quote field for side-by-side comparison UI
+- Fixed autojunk=False in SequenceMatcher (critical bug fix)
+- Added /health endpoint
+- compute_match_with_diffs now returns 4 values (score, diffs, verified_html, source_quote)
 REVISIONS v1.6:
 - Split at em-dashes before extracting distinctive window
 - Fixes: "basin—Seymour" no longer blocks finding "buspirone"
@@ -76,6 +83,7 @@ class BookMatch:
     error: str = ""
     diffs: List[Dict[str, Any]] = field(default_factory=list)  # Diff details as dicts
     verified_quote: str = ""  # User's quote with diffs marked
+    source_quote: str = ""  # Authentic text from source for side-by-side
 
 @dataclass
 class SearchResponse:
@@ -86,7 +94,7 @@ class SearchResponse:
 # FASTAPI APP
 # =============================================================================
 
-app = FastAPI(title="Google Books Test App v1.3")
+app = FastAPI(title="Google Books Test App v2.0")
 
 class SearchRequest(BaseModel):
     quote: str
@@ -299,6 +307,73 @@ def extract_distinctive_window(text: str, max_chars: int = 200) -> str:
     return window
 
 
+def extract_anchor_window(text: str, window_size: int = 40, min_score: int = 50) -> Optional[str]:
+    """
+    Extract a character window around the most distinctive word in text.
+    
+    Layer 1 of two-layer search: Creates a search string anchored to a
+    distinctive word, avoiding typo-prone common words.
+    
+    Window positioning based on anchor location:
+    - First 25% of text:  anchor + chars after
+    - Middle 50% of text: chars before + anchor + chars after (centered)
+    - Last 25% of text:   chars before + anchor
+    
+    Args:
+        text: User's quote text
+        window_size: Total characters to extract around anchor (default 40)
+        min_score: Minimum distinctiveness score to qualify (default 50)
+        
+    Returns:
+        Character window string, or None if no suitable anchor found
+    """
+    if not text or len(text) < 20:
+        return None
+    
+    # Find all words with positions
+    best_anchor = None
+    best_score = -1
+    best_start = 0
+    best_end = 0
+    
+    for match in re.finditer(r'§\s*\d+|\d+\s*[A-Z]\.[A-Z]\.[A-Z]\.|\S+', text):
+        word = match.group()
+        score = score_word_distinctiveness(word)
+        if score > best_score and score >= min_score:
+            best_score = score
+            best_anchor = word
+            best_start = match.start()
+            best_end = match.end()
+    
+    if not best_anchor:
+        logger.info("No suitable anchor found (all words below min_score)")
+        return None
+    
+    text_len = len(text)
+    anchor_pos_ratio = best_start / text_len
+    
+    # Determine window boundaries based on anchor position
+    if anchor_pos_ratio < 0.25:
+        # Anchor near start: take anchor + chars after
+        win_start = best_start
+        win_end = min(text_len, best_end + window_size)
+    elif anchor_pos_ratio > 0.75:
+        # Anchor near end: take chars before + anchor
+        win_start = max(0, best_start - window_size)
+        win_end = best_end
+    else:
+        # Anchor in middle: center the window
+        half_window = window_size // 2
+        win_start = max(0, best_start - half_window)
+        win_end = min(text_len, best_end + half_window)
+    
+    window = text[win_start:win_end].strip()
+    
+    logger.info(f"Anchor window: '{best_anchor}' (score={best_score}) at {anchor_pos_ratio:.0%} → '{window[:50]}...'")
+    
+    return window
+
+
 def compute_dynamic_threshold(quote_len: int, snippet_len: int, base_threshold: float = 0.90) -> float:
     """
     Adjust match threshold based on length ratio.
@@ -349,16 +424,17 @@ def compute_match_score(user_quote: str, source_text: str) -> float:
     cutoff = int(len(u) * 0.5)
     if len(u) > 20 and u[:cutoff] in s: return 0.9
     
-    return SequenceMatcher(None, u, s).ratio()
+    # CRITICAL: autojunk=False prevents SequenceMatcher from ignoring common chars
+    return SequenceMatcher(None, u, s, autojunk=False).ratio()
 
 
 def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
     """
     Computes match score AND identifies character-level differences.
-    Returns: (score, diffs_list, verified_quote_html)
+    Returns: (score, diffs_list, verified_quote_html, source_quote)
     """
     if not user_quote or not source_text:
-        return 0.0, [], user_quote
+        return 0.0, [], user_quote, ""
     
     # Strip HTML tags and decode entities from snippet
     clean_source = re.sub(r'<[^>]+>', '', source_text)
@@ -375,7 +451,8 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
     source_norm = normalize_for_match(clean_source)
     
     # Use SequenceMatcher to find differences
-    matcher = SequenceMatcher(None, user_norm.lower(), source_norm.lower())
+    # CRITICAL: autojunk=False prevents SequenceMatcher from ignoring common chars
+    matcher = SequenceMatcher(None, user_norm.lower(), source_norm.lower(), autojunk=False)
     score = matcher.ratio()
     
     diffs = []
@@ -419,7 +496,7 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
             ))
             verified_html += f'<span class="diff-missing" title="Missing: {html.escape(source_segment)}">[...]</span>'
     
-    return score, diffs, verified_html
+    return score, diffs, verified_html, source_norm
 
 # =============================================================================
 # CASCADING SEARCH LOGIC
@@ -428,15 +505,21 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
 async def search_google_books_cascading(quote: str, author: str) -> SearchResponse:
     """
     Tries multiple search strategies until one works:
+    0. Anchor window search (typo-resistant case identification)
     1. Distinctive window (200 chars from most distinctive word)
     2. Fuzzy matching (90% threshold)
     3. Keyword fallback (50% threshold)
+    
+    Returns best available results with warnings if no strategy meets threshold.
     """
     trace = []
     clean_q = clean_quote_text(quote)
     
     # Split at em-dashes and take segment with most distinctive word
     clean_q = split_at_dashes(clean_q)
+    
+    # Extract 40-char window around best anchor for Phase 0 (typo-resistant)
+    anchor_window = extract_anchor_window(clean_q, window_size=40, min_score=50)
     
     # Extract 200-char window starting from most distinctive word
     distinctive_q = extract_distinctive_window(clean_q, max_chars=200)
@@ -447,15 +530,65 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
     
     trace.append(f"Search window: {distinctive_q[:60]}...")
     
-    # PHASE 1: Exact phrase strategies (trusted, match_score = 1.0)
-    exact_strategies = [
-        {"name": "Distinctive Window + Author", "q": distinctive_q, "auth": author},
-        {"name": "Distinctive Window Only", "q": distinctive_q, "auth": None},
-        {"name": "Short Fragment + Author", "q": short_q, "auth": author},
-        {"name": "Short Fragment Only", "q": short_q, "auth": None},
-    ]
+    # Track best results found across all phases (for showing with errors)
+    best_results = []
     
     async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+        
+        # =================================================================
+        # PHASE 0: Anchor window search (typo-resistant identification)
+        # =================================================================
+        if anchor_window:
+            trace.append(f"Phase 0 - Anchor window: {anchor_window[:50]}...")
+            logger.info(f"Phase 0 - Trying anchor window: {anchor_window}")
+            
+            search_query = anchor_window  # No quotes for fuzzy matching
+            if author:
+                search_query += f" inauthor:{author}"
+            
+            try:
+                resp = await client.get(GOOGLE_BOOKS_BASE_URL, params={
+                    "q": search_query, "key": GOOGLE_BOOKS_API_KEY, "maxResults": 10, "printType": "books"
+                })
+                data = resp.json()
+                items = data.get("items", [])
+                
+                if items:
+                    trace.append(f"Phase 0 - Found {len(items)} candidate(s), verifying...")
+                    logger.info(f"Phase 0 - Found {len(items)} candidates")
+                    
+                    parsed = parse_google_items(items, quote)
+                    # Sort by match score descending
+                    parsed.sort(key=lambda r: r.match_score, reverse=True)
+                    
+                    # Check for high-confidence matches (>= 80%)
+                    for r in parsed:
+                        if r.match_score >= 0.80:
+                            trace.append(f"✅ Phase 0 verified: {r.match_score:.0%} match in '{r.title[:30]}...'")
+                            logger.info(f"✅ Phase 0 success: {r.match_score:.0%} match")
+                            return SearchResponse(results=[r], trace=trace)
+                    
+                    # Track best for potential fallback return
+                    if parsed and (not best_results or parsed[0].match_score > best_results[0].match_score):
+                        best_results = parsed[:5]
+                    
+                    trace.append(f"Phase 0 - No candidate >= 80% (best: {parsed[0].match_score:.0%})")
+                else:
+                    trace.append("Phase 0 - No candidates found")
+                    logger.info("Phase 0 - 0 results from anchor window search")
+            except Exception as e:
+                trace.append(f"⚠️ Phase 0 Error: {str(e)}")
+        
+        # =================================================================
+        # PHASE 1: Exact phrase strategies (trusted, match_score = 1.0)
+        # =================================================================
+        exact_strategies = [
+            {"name": "Distinctive Window + Author", "q": distinctive_q, "auth": author},
+            {"name": "Distinctive Window Only", "q": distinctive_q, "auth": None},
+            {"name": "Short Fragment + Author", "q": short_q, "auth": author},
+            {"name": "Short Fragment Only", "q": short_q, "auth": None},
+        ]
+        
         for strategy in exact_strategies:
             # Skip author strategies if no author provided
             if strategy["auth"] is not None and not author:
@@ -487,7 +620,9 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
             except Exception as e:
                 trace.append(f"⚠️ Error: {str(e)}")
         
+        # =================================================================
         # PHASE 2: Fuzzy strategies (no quotes, verify with 90% threshold)
+        # =================================================================
         trace.append("Exact phrase exhausted, trying fuzzy matching...")
         
         fuzzy_strategies = [
@@ -504,13 +639,16 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
             
             try:
                 resp = await client.get(GOOGLE_BOOKS_BASE_URL, params={
-                    "q": search_query, "key": GOOGLE_BOOKS_API_KEY, "maxResults": 5, "printType": "books"
+                    "q": search_query, "key": GOOGLE_BOOKS_API_KEY, "maxResults": 10, "printType": "books"
                 })
                 data = resp.json()
                 items = data.get("items", [])
                 
                 if items:
                     parsed = parse_google_items(items, quote)
+                    # Sort by match score descending
+                    parsed.sort(key=lambda r: r.match_score, reverse=True)
+                    
                     # Filter by DYNAMIC threshold (adjusts for length mismatch)
                     quote_len = len(quote)
                     verified = []
@@ -525,13 +663,18 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                         trace.append(f"✅ Found {len(verified)} result(s) above dynamic threshold")
                         return SearchResponse(results=verified, trace=trace)
                     else:
-                        trace.append(f"❌ {len(parsed)} results but none above dynamic threshold")
+                        # Track best for potential fallback return
+                        if parsed and (not best_results or parsed[0].match_score > best_results[0].match_score):
+                            best_results = parsed[:5]
+                        trace.append(f"❌ {len(parsed)} results but none above dynamic threshold (best: {parsed[0].match_score:.0%})")
                 else:
                     trace.append("❌ 0 results.")
             except Exception as e:
                 trace.append(f"⚠️ Error: {str(e)}")
         
+        # =================================================================
         # PHASE 3: Keyword fallback (dynamic threshold, base 50%)
+        # =================================================================
         trace.append("Fuzzy matching exhausted, trying keyword fallback...")
         keywords = extract_keywords_for_search(quote, max_keywords=10)
         
@@ -544,13 +687,16 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
             
             try:
                 resp = await client.get(GOOGLE_BOOKS_BASE_URL, params={
-                    "q": keyword_query, "key": GOOGLE_BOOKS_API_KEY, "maxResults": 5, "printType": "books"
+                    "q": keyword_query, "key": GOOGLE_BOOKS_API_KEY, "maxResults": 10, "printType": "books"
                 })
                 data = resp.json()
                 items = data.get("items", [])
                 
                 if items:
                     parsed = parse_google_items(items, quote)
+                    # Sort by match score descending
+                    parsed.sort(key=lambda r: r.match_score, reverse=True)
+                    
                     # Dynamic threshold with lower base for keyword fallback
                     quote_len = len(quote)
                     verified = []
@@ -564,13 +710,24 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                         trace.append(f"✅ Found {len(verified)} result(s) via keyword fallback")
                         return SearchResponse(results=verified, trace=trace)
                     else:
-                        trace.append("❌ Keyword results below dynamic threshold")
+                        # Track best for potential fallback return
+                        if parsed and (not best_results or parsed[0].match_score > best_results[0].match_score):
+                            best_results = parsed[:5]
+                        trace.append(f"❌ Keyword results below dynamic threshold (best: {parsed[0].match_score:.0%})")
                 else:
                     trace.append("❌ 0 keyword results.")
             except Exception as e:
                 trace.append(f"⚠️ Error: {str(e)}")
+        
+        # =================================================================
+        # Return best available results (with warning)
+        # =================================================================
+        if best_results:
+            trace.append(f"⚠️ Returning best available matches (may contain errors)")
+            logger.info(f"⚠️ Returning {len(best_results)} best available results with potential errors")
+            return SearchResponse(results=best_results, trace=trace)
 
-    trace.append("⛔ All strategies exhausted.")
+    trace.append("⛔ All strategies exhausted - no results found")
     return SearchResponse(results=[], trace=trace)
 
 def parse_google_items(items, original_quote):
@@ -579,8 +736,8 @@ def parse_google_items(items, original_quote):
         vol = item.get("volumeInfo", {})
         snip = item.get("searchInfo", {}).get("textSnippet", "")
         
-        # Compute score and detect differences
-        score, diffs, verified_html = compute_match_with_diffs(original_quote, snip)
+        # Compute score and detect differences (now returns 4 values)
+        score, diffs, verified_html, source_quote = compute_match_with_diffs(original_quote, snip)
         
         parsed.append(BookMatch(
             title=vol.get("title", "Unknown"),
@@ -592,7 +749,8 @@ def parse_google_items(items, original_quote):
             published_date=vol.get("publishedDate", ""),
             source="google_api",
             diffs=[asdict(d) for d in diffs],  # Convert to dict for JSON serialization
-            verified_quote=verified_html
+            verified_quote=verified_html,
+            source_quote=source_quote
         ))
     return parsed
 
@@ -655,13 +813,23 @@ async def serp_search(req: SearchRequest):
 async def config():
     return {"google": bool(GOOGLE_BOOKS_API_KEY), "serp": bool(SERPAPI_KEY)}
 
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {
+        "status": "ok",
+        "google_api_configured": bool(GOOGLE_BOOKS_API_KEY),
+        "serpapi_configured": bool(SERPAPI_KEY),
+        "google_api_key_length": len(GOOGLE_BOOKS_API_KEY)
+    }
+
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Google Books Tester v1.3</title>
+        <title>Google Books Tester v2.0</title>
         <style>
             body { font-family: sans-serif; max-width: 900px; margin: 20px auto; padding: 20px; }
             .box { border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
@@ -678,11 +846,19 @@ async def home():
             .error-item { margin: 5px 0; padding: 5px; background: #fff; border-radius: 3px; font-family: monospace; font-size: 12px; }
             .snippet-label { color: #666; font-size: 0.9em; margin-top: 10px; }
             .snippet-text { font-style: italic; color: #555; font-size: 0.9em; }
+            .comparison-container { display: flex; gap: 15px; margin: 15px 0; }
+            .comparison-panel { flex: 1; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
+            .comparison-header { padding: 10px 15px; font-weight: bold; font-size: 0.9em; }
+            .comparison-header.user { background: #e3f2fd; color: #1565c0; }
+            .comparison-header.source { background: #e8f5e9; color: #2e7d32; }
+            .comparison-body { padding: 15px; background: #fff; line-height: 1.6; min-height: 100px; }
+            .comparison-body.user { border-top: 3px solid #1565c0; }
+            .comparison-body.source { border-top: 3px solid #2e7d32; }
         </style>
     </head>
     <body>
-        <h1>📚 Google Books Tester v1.3</h1>
-        <p style="color:#666">Now with quotation accuracy verification</p>
+        <h1>📚 Google Books Tester v2.0</h1>
+        <p style="color:#666">Now with side-by-side quotation accuracy verification</p>
         <div class="box">
             <textarea id="quote" rows="4" placeholder="Enter quotation to verify..."></textarea>
             <input id="author" placeholder="Author (Optional)">
@@ -695,6 +871,13 @@ async def home():
             function prefill() {
                 document.getElementById('quote').value = "Sensations roar back; his mind feels as if it becomes the huge, curved mirror of a radar telescope, gathering light from the farthest corners of the universe. Every time he steps outside, he can hear the clouds grinding through the sky.";
                 document.getElementById('author').value = "Doerr";
+            }
+            
+            function escapeHtml(text) {
+                if (!text) return '';
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
             }
             
             async function runTest() {
@@ -723,9 +906,24 @@ async def home():
                         html += `<div class="result">
                             <div class="result-title">${statusIcon} ${r.title}</div>
                             <div>Authors: ${r.authors.join(', ') || 'Unknown'}</div>
-                            <div>Match Score: ${Math.round(r.match_score*100)}%</div>
-                            <div style="margin-top:10px"><strong>Your Quotation (${statusText}):</strong></div>
-                            <div class="verified-quote">${r.verified_quote || quote}</div>`;
+                            <div>Match Score: ${Math.round(r.match_score*100)}%</div>`;
+                        
+                        // Side-by-side comparison
+                        if (r.verified_quote && r.source_quote) {
+                            html += `<div class="comparison-container">
+                                <div class="comparison-panel">
+                                    <div class="comparison-header user">📝 Your Quotation</div>
+                                    <div class="comparison-body user">${r.verified_quote}</div>
+                                </div>
+                                <div class="comparison-panel">
+                                    <div class="comparison-header source">✓ Authentic Source</div>
+                                    <div class="comparison-body source">${escapeHtml(r.source_quote)}</div>
+                                </div>
+                            </div>`;
+                        } else if (r.verified_quote) {
+                            html += `<div style="margin-top:10px"><strong>Your Quotation (${statusText}):</strong></div>
+                                <div class="verified-quote">${r.verified_quote}</div>`;
+                        }
                         
                         if(hasErrors) {
                             html += `<div class="error-summary">
@@ -733,11 +931,11 @@ async def home():
                             r.diffs.forEach((d, i) => {
                                 let desc = '';
                                 if(d.diff_type === 'substitution') {
-                                    desc = `You wrote "<b>${d.user_text}</b>" → Source has "<b>${d.source_text}</b>"`;
+                                    desc = `You wrote "<b>${escapeHtml(d.user_text)}</b>" → Source has "<b>${escapeHtml(d.source_text)}</b>"`;
                                 } else if(d.diff_type === 'insertion') {
-                                    desc = `"<b>${d.user_text}</b>" not found in source`;
+                                    desc = `"<b>${escapeHtml(d.user_text)}</b>" not found in source`;
                                 } else if(d.diff_type === 'deletion') {
-                                    desc = `Missing from your quote: "<b>${d.source_text}</b>"`;
+                                    desc = `Missing from your quote: "<b>${escapeHtml(d.source_text)}</b>"`;
                                 }
                                 html += `<div class="error-item">${i+1}. ${desc}</div>`;
                             });
@@ -745,7 +943,7 @@ async def home():
                         }
                         
                         html += `<div class="snippet-label">Source snippet from Google Books:</div>
-                            <div class="snippet-text">"${r.snippet}"</div>
+                            <div class="snippet-text">"${escapeHtml(r.snippet)}"</div>
                         </div>`;
                     });
                 }
