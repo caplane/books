@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Google Books Standalone Test App (v2.2 - Whitespace Normalization)
-===================================================================
+Google Books Standalone Test App (v2.3 - Extended Text Fetch)
+==============================================================
+REVISIONS v2.3:
+- Added volume details fetch to try getting extended text
+- Logs full API response structure for debugging
+- Checks description, layerInfo for additional text content
 REVISIONS v2.2:
 - Added whitespace normalization before comparison (fixes alignment issues)
 - Google Books snippets have extra spaces around punctuation (" ; " vs "; ")
@@ -102,7 +106,7 @@ class SearchResponse:
 # FASTAPI APP
 # =============================================================================
 
-app = FastAPI(title="Google Books Test App v2.2")
+app = FastAPI(title="Google Books Test App v2.3")
 
 class SearchRequest(BaseModel):
     quote: str
@@ -623,7 +627,7 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                     trace.append(f"Phase 0 - Found {len(items)} candidate(s), verifying...")
                     logger.info(f"Phase 0 - Found {len(items)} candidates")
                     
-                    parsed = parse_google_items(items, quote)
+                    parsed = await parse_google_items_async(client, items, quote)
                     # Sort by match score descending
                     parsed.sort(key=lambda r: r.match_score, reverse=True)
                     
@@ -674,7 +678,7 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                 items = data.get("items", [])
                 
                 if items:
-                    parsed = parse_google_items(items, quote)
+                    parsed = await parse_google_items_async(client, items, quote)
                     # EXACT PHRASE SEARCH: Trust the match
                     for r in parsed:
                         r.match_score = 1.0
@@ -711,7 +715,7 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                 items = data.get("items", [])
                 
                 if items:
-                    parsed = parse_google_items(items, quote)
+                    parsed = await parse_google_items_async(client, items, quote)
                     # Sort by match score descending
                     parsed.sort(key=lambda r: r.match_score, reverse=True)
                     
@@ -759,7 +763,7 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
                 items = data.get("items", [])
                 
                 if items:
-                    parsed = parse_google_items(items, quote)
+                    parsed = await parse_google_items_async(client, items, quote)
                     # Sort by match score descending
                     parsed.sort(key=lambda r: r.match_score, reverse=True)
                     
@@ -795,6 +799,81 @@ async def search_google_books_cascading(quote: str, author: str) -> SearchRespon
 
     trace.append("⛔ All strategies exhausted - no results found")
     return SearchResponse(results=[], trace=trace)
+
+async def fetch_volume_details(client: httpx.AsyncClient, volume_id: str) -> dict:
+    """
+    Fetch detailed volume info which may include more text content.
+    """
+    try:
+        url = f"https://www.googleapis.com/books/v1/volumes/{volume_id}"
+        resp = await client.get(url, params={"key": GOOGLE_BOOKS_API_KEY})
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"Failed to fetch volume details for {volume_id}: {e}")
+    return {}
+
+
+async def parse_google_items_async(client: httpx.AsyncClient, items, original_quote):
+    """
+    Parse Google Books items and try to fetch extended text from volume details.
+    """
+    parsed = []
+    for item in items:
+        vol = item.get("volumeInfo", {})
+        volume_id = item.get("id", "")
+        snip = item.get("searchInfo", {}).get("textSnippet", "")
+        
+        # Log full item structure for first result (debug)
+        if not parsed:
+            logger.info(f"First result keys: {list(item.keys())}")
+            if "accessInfo" in item:
+                logger.info(f"accessInfo keys: {list(item.get('accessInfo', {}).keys())}")
+        
+        # Try to get extended text from volume details
+        extended_text = snip
+        if volume_id:
+            details = await fetch_volume_details(client, volume_id)
+            if details:
+                # Check various fields that might have more text
+                search_info = details.get("searchInfo", {})
+                if search_info.get("textSnippet"):
+                    detail_snip = search_info.get("textSnippet", "")
+                    if len(detail_snip) > len(snip):
+                        extended_text = detail_snip
+                        logger.info(f"Extended snippet from volume details: {len(snip)} → {len(detail_snip)} chars")
+                
+                # Check for layerInfo or other text fields
+                layer_info = details.get("layerInfo", {})
+                if layer_info:
+                    logger.info(f"layerInfo keys: {list(layer_info.keys())}")
+                
+                # Check volumeInfo for description (sometimes contains quotes)
+                vol_info = details.get("volumeInfo", {})
+                description = vol_info.get("description", "")
+                if description and original_quote[:50].lower() in description.lower():
+                    logger.info(f"Quote found in description! Length: {len(description)}")
+                    if len(description) > len(extended_text):
+                        extended_text = description
+        
+        # Compute score and detect differences
+        score, diffs, verified_html, source_quote = compute_match_with_diffs(original_quote, extended_text)
+        
+        parsed.append(BookMatch(
+            title=vol.get("title", "Unknown"),
+            authors=vol.get("authors", []),
+            match_score=score,
+            snippet=extended_text,  # Use extended text
+            has_text_snippet=bool(extended_text),
+            url=vol.get("previewLink", ""),
+            published_date=vol.get("publishedDate", ""),
+            source="google_api",
+            diffs=[asdict(d) for d in diffs],
+            verified_quote=verified_html,
+            source_quote=source_quote
+        ))
+    return parsed
+
 
 def parse_google_items(items, original_quote):
     parsed = []
@@ -895,7 +974,7 @@ async def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Google Books Tester v2.2</title>
+        <title>Google Books Tester v2.3</title>
         <style>
             body { font-family: sans-serif; max-width: 900px; margin: 20px auto; padding: 20px; }
             .box { border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
@@ -923,7 +1002,7 @@ async def home():
         </style>
     </head>
     <body>
-        <h1>📚 Google Books Tester v2.2</h1>
+        <h1>📚 Google Books Tester v2.3</h1>
         <p style="color:#666">Now with side-by-side quotation accuracy verification</p>
         <div class="box">
             <textarea id="quote" rows="4" placeholder="Enter quotation to verify..."></textarea>
