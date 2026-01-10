@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Google Books Standalone Test App (v2.1 - Diff Filtering)
-=========================================================
+Google Books Standalone Test App (v2.2 - Whitespace Normalization)
+===================================================================
+REVISIONS v2.2:
+- Added whitespace normalization before comparison (fixes alignment issues)
+- Google Books snippets have extra spaces around punctuation (" ; " vs "; ")
+- This threw off SequenceMatcher alignment, hiding single-char errors like "preparin" → "preparing"
 REVISIONS v2.1:
 - Filter empty/whitespace-only diffs (eliminates spurious "" diff noise)
 - Filter boundary deletions at position 0 and end (snippet truncation artifacts)
@@ -98,7 +102,7 @@ class SearchResponse:
 # FASTAPI APP
 # =============================================================================
 
-app = FastAPI(title="Google Books Test App v2.1")
+app = FastAPI(title="Google Books Test App v2.2")
 
 class SearchRequest(BaseModel):
     quote: str
@@ -455,67 +459,84 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
         t = t.replace('\u2014', '-').replace('\u2013', '-')
         return t
     
+    # Normalize whitespace for COMPARISON only (not display)
+    # Google Books snippets have extra spaces around punctuation (" ; " instead of "; ")
+    # which throws off SequenceMatcher alignment
+    def normalize_whitespace(t):
+        # Remove space BEFORE punctuation ("; " stays, " ; " becomes "; ")
+        t = re.sub(r'\s+([;:,.\?!])', r'\1', t)
+        # Collapse multiple spaces to single space
+        t = ' '.join(t.split())
+        return t
+    
     user_norm = normalize_for_match(user_quote)
     source_norm = normalize_for_match(clean_source)
     
+    # For comparison: also normalize whitespace
+    user_compare = normalize_whitespace(user_norm.lower())
+    source_compare = normalize_whitespace(source_norm.lower())
+    
     # Use SequenceMatcher to find differences
     # CRITICAL: autojunk=False prevents SequenceMatcher from ignoring common chars
-    matcher = SequenceMatcher(None, user_norm.lower(), source_norm.lower(), autojunk=False)
+    matcher = SequenceMatcher(None, user_compare, source_compare, autojunk=False)
     score = matcher.ratio()
     
     diffs = []
     verified_html = ""
-    user_len = len(user_norm)
+    user_len = len(user_compare)
     
     # Get matching blocks and identify differences
     opcodes = matcher.get_opcodes()
     
+    # Map comparison positions back to display positions
+    # (they differ because normalize_whitespace changes lengths)
+    # Strategy: Track position in user_norm (display) separately
+    display_pos = 0
+    
     for tag, i1, i2, j1, j2 in opcodes:
-        user_segment = user_norm[i1:i2]
-        source_segment = source_norm[j1:j2]
+        # Get segments from COMPARISON strings (for diff logic)
+        user_segment_compare = user_compare[i1:i2]
+        source_segment_compare = source_compare[j1:j2]
+        
+        # Calculate how many chars to advance in display string
+        # This is approximate but works for most cases
+        segment_len = i2 - i1
+        user_segment_display = user_norm[display_pos:display_pos + segment_len] if segment_len > 0 else ""
+        
+        # For source segment in diffs, use the comparison version (it's cleaner)
+        source_segment = source_segment_compare
         
         if tag == 'equal':
             # Matching text - no highlight
-            verified_html += html.escape(user_segment)
+            verified_html += html.escape(user_segment_display)
+            display_pos += segment_len
         elif tag == 'replace':
             # Skip empty/whitespace-only diffs (noise)
-            if not user_segment.strip() and not source_segment.strip():
-                verified_html += html.escape(user_segment)
+            if not user_segment_compare.strip() and not source_segment_compare.strip():
+                verified_html += html.escape(user_segment_display)
+                display_pos += segment_len
                 continue
             # Substitution - user wrote something different
             diffs.append(DiffSegment(
                 position=i1,
-                user_text=user_segment,
+                user_text=user_segment_compare,
                 source_text=source_segment,
                 diff_type='substitution'
             ))
-            verified_html += f'<span class="diff-error" title="Source: {html.escape(source_segment)}">{html.escape(user_segment)}</span>'
+            verified_html += f'<span class="diff-error" title="Source: {html.escape(source_segment)}">{html.escape(user_segment_display)}</span>'
+            display_pos += segment_len
         elif tag == 'insert':
+            # SequenceMatcher 'insert' means: SOURCE has text that USER is missing
+            # (need to insert source text into user to make them match)
             # Skip empty/whitespace-only diffs (noise)
-            if not user_segment.strip():
-                verified_html += html.escape(user_segment)
-                continue
-            # User added text not in source
-            diffs.append(DiffSegment(
-                position=i1,
-                user_text=user_segment,
-                source_text="",
-                diff_type='insertion'
-            ))
-            verified_html += f'<span class="diff-error" title="Not in source">{html.escape(user_segment)}</span>'
-        elif tag == 'delete':
-            # Skip empty/whitespace-only diffs (noise)
-            if not source_segment.strip():
+            if not source_segment_compare.strip():
                 continue
             # Skip boundary deletions (snippet truncation artifacts)
-            # - Deletions at position 0 are likely missing text BEFORE snippet started
-            # - Deletions at end (j2 near source length) are likely snippet cutoff
             is_start_boundary = (i1 == 0 and j1 == 0)
-            is_end_boundary = (i2 >= user_len - 5)  # Within 5 chars of end
+            is_end_boundary = (i2 >= user_len - 5)
             if is_start_boundary or is_end_boundary:
-                # Don't add to diffs, don't show [...] marker
                 continue
-            # User missing text that's in source
+            # User is MISSING text that's in source (deletion error)
             diffs.append(DiffSegment(
                 position=i1,
                 user_text="",
@@ -523,6 +544,23 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
                 diff_type='deletion'
             ))
             verified_html += f'<span class="diff-missing" title="Missing: {html.escape(source_segment)}">[...]</span>'
+        elif tag == 'delete':
+            # SequenceMatcher 'delete' means: USER has text that SOURCE doesn't have
+            # (need to delete user text to make it match source)
+            # Skip empty/whitespace-only diffs (noise)
+            if not user_segment_compare.strip():
+                verified_html += html.escape(user_segment_display)
+                display_pos += segment_len
+                continue
+            # User ADDED text not in source (insertion error)
+            diffs.append(DiffSegment(
+                position=i1,
+                user_text=user_segment_compare,
+                source_text="",
+                diff_type='insertion'
+            ))
+            verified_html += f'<span class="diff-error" title="Not in source">{html.escape(user_segment_display)}</span>'
+            display_pos += segment_len
     
     return score, diffs, verified_html, source_norm
 
@@ -857,7 +895,7 @@ async def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Google Books Tester v2.1</title>
+        <title>Google Books Tester v2.2</title>
         <style>
             body { font-family: sans-serif; max-width: 900px; margin: 20px auto; padding: 20px; }
             .box { border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
@@ -885,7 +923,7 @@ async def home():
         </style>
     </head>
     <body>
-        <h1>📚 Google Books Tester v2.1</h1>
+        <h1>📚 Google Books Tester v2.2</h1>
         <p style="color:#666">Now with side-by-side quotation accuracy verification</p>
         <div class="box">
             <textarea id="quote" rows="4" placeholder="Enter quotation to verify..."></textarea>
