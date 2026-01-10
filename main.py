@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Google Books Standalone Test App (v2.0 - Aligned with CourtListener)
-=====================================================================
+Google Books Standalone Test App (v2.1 - Diff Filtering)
+=========================================================
+REVISIONS v2.1:
+- Filter empty/whitespace-only diffs (eliminates spurious "" diff noise)
+- Filter boundary deletions at position 0 and end (snippet truncation artifacts)
+- Added stripHtml() for raw snippet display (removes Google Books <b> tags)
 REVISIONS v2.0:
 - Added Phase 0 anchor window search (typo-resistant case identification)
 - Added best_results tracking across all phases (returns with warning if no threshold met)
@@ -94,7 +98,7 @@ class SearchResponse:
 # FASTAPI APP
 # =============================================================================
 
-app = FastAPI(title="Google Books Test App v2.0")
+app = FastAPI(title="Google Books Test App v2.1")
 
 class SearchRequest(BaseModel):
     quote: str
@@ -432,6 +436,10 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
     """
     Computes match score AND identifies character-level differences.
     Returns: (score, diffs_list, verified_quote_html, source_quote)
+    
+    Filters out:
+    - Empty/whitespace-only diffs (noise from SequenceMatcher)
+    - Boundary deletions at position 0 (snippet truncation artifacts)
     """
     if not user_quote or not source_text:
         return 0.0, [], user_quote, ""
@@ -457,6 +465,7 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
     
     diffs = []
     verified_html = ""
+    user_len = len(user_norm)
     
     # Get matching blocks and identify differences
     opcodes = matcher.get_opcodes()
@@ -469,6 +478,10 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
             # Matching text - no highlight
             verified_html += html.escape(user_segment)
         elif tag == 'replace':
+            # Skip empty/whitespace-only diffs (noise)
+            if not user_segment.strip() and not source_segment.strip():
+                verified_html += html.escape(user_segment)
+                continue
             # Substitution - user wrote something different
             diffs.append(DiffSegment(
                 position=i1,
@@ -478,6 +491,10 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
             ))
             verified_html += f'<span class="diff-error" title="Source: {html.escape(source_segment)}">{html.escape(user_segment)}</span>'
         elif tag == 'insert':
+            # Skip empty/whitespace-only diffs (noise)
+            if not user_segment.strip():
+                verified_html += html.escape(user_segment)
+                continue
             # User added text not in source
             diffs.append(DiffSegment(
                 position=i1,
@@ -487,6 +504,17 @@ def compute_match_with_diffs(user_quote: str, source_text: str) -> tuple:
             ))
             verified_html += f'<span class="diff-error" title="Not in source">{html.escape(user_segment)}</span>'
         elif tag == 'delete':
+            # Skip empty/whitespace-only diffs (noise)
+            if not source_segment.strip():
+                continue
+            # Skip boundary deletions (snippet truncation artifacts)
+            # - Deletions at position 0 are likely missing text BEFORE snippet started
+            # - Deletions at end (j2 near source length) are likely snippet cutoff
+            is_start_boundary = (i1 == 0 and j1 == 0)
+            is_end_boundary = (i2 >= user_len - 5)  # Within 5 chars of end
+            if is_start_boundary or is_end_boundary:
+                # Don't add to diffs, don't show [...] marker
+                continue
             # User missing text that's in source
             diffs.append(DiffSegment(
                 position=i1,
@@ -829,7 +857,7 @@ async def home():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Google Books Tester v2.0</title>
+        <title>Google Books Tester v2.1</title>
         <style>
             body { font-family: sans-serif; max-width: 900px; margin: 20px auto; padding: 20px; }
             .box { border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
@@ -857,7 +885,7 @@ async def home():
         </style>
     </head>
     <body>
-        <h1>📚 Google Books Tester v2.0</h1>
+        <h1>📚 Google Books Tester v2.1</h1>
         <p style="color:#666">Now with side-by-side quotation accuracy verification</p>
         <div class="box">
             <textarea id="quote" rows="4" placeholder="Enter quotation to verify..."></textarea>
@@ -878,6 +906,13 @@ async def home():
                 const div = document.createElement('div');
                 div.textContent = text;
                 return div.innerHTML;
+            }
+            
+            function stripHtml(text) {
+                if (!text) return '';
+                const div = document.createElement('div');
+                div.innerHTML = text;
+                return div.textContent || div.innerText || '';
             }
             
             async function runTest() {
@@ -943,7 +978,7 @@ async def home():
                         }
                         
                         html += `<div class="snippet-label">Source snippet from Google Books:</div>
-                            <div class="snippet-text">"${escapeHtml(r.snippet)}"</div>
+                            <div class="snippet-text">"${stripHtml(r.snippet)}"</div>
                         </div>`;
                     });
                 }
